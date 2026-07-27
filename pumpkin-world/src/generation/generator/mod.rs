@@ -1,13 +1,19 @@
 use pumpkin_data::BlockState;
+use pumpkin_data::chunk::Biome;
 use pumpkin_data::chunk_gen_settings::GenerationSettings;
 use pumpkin_data::dimension::Dimension;
 use pumpkin_data::noise_router::{
     END_BASE_NOISE_ROUTER, NETHER_BASE_NOISE_ROUTER, OVERWORLD_BASE_NOISE_ROUTER,
 };
 
-use super::noise::router::proto_noise_router::ProtoNoiseRouters;
+use super::noise::router::{
+    multi_noise_sampler::{MultiNoiseSampler, MultiNoiseSamplerBuilderOptions},
+    proto_noise_router::ProtoNoiseRouters,
+};
+use crate::biome::{BiomeSupplier, MultiNoiseBiomeSupplier, end::TheEndBiomeSupplier};
+use crate::generation::noise::CHUNK_DIM;
 use crate::generation::proto_chunk::TerrainCache;
-use crate::generation::{GlobalRandomConfig, Seed};
+use crate::generation::{GlobalRandomConfig, Seed, biome_coords};
 
 pub mod structure_finder;
 
@@ -73,6 +79,51 @@ pub struct VanillaGenerator {
     pub global_structure_cache: crate::generation::structure::placement::GlobalStructureCache,
     pub structure_calculator: StructurePlacementCalculator,
     pub structure_allowed_biomes: FxHashMap<usize, Vec<u16>>,
+}
+
+impl VanillaGenerator {
+    /// Mirrors the worldgen `BiomeManager#getBiome` lookup after its zoom/fuzz
+    /// selects a quart. Unlike `ProtoChunk` storage, this resolver has no chunk
+    /// boundary and therefore never wraps or clamps X/Z.
+    #[must_use]
+    pub fn terrain_gen_biome_at_block(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        sampler: &mut MultiNoiseSampler<'_>,
+    ) -> &'static Biome {
+        let quart = crate::generation::biome::get_biome_blend(
+            self.dimension.min_y as i8,
+            self.dimension.height as u16,
+            self.biome_mixer_seed,
+            x,
+            y,
+            z,
+        );
+        if self.dimension == Dimension::THE_END {
+            TheEndBiomeSupplier.biome(quart.x, quart.y, quart.z, sampler)
+        } else if self.dimension == Dimension::THE_NETHER {
+            MultiNoiseBiomeSupplier::NETHER.biome(quart.x, quart.y, quart.z, sampler)
+        } else {
+            MultiNoiseBiomeSupplier::OVERWORLD.biome(quart.x, quart.y, quart.z, sampler)
+        }
+    }
+
+    /// Creates a sampler whose flat caches include the one-quart halo selected
+    /// by the biome zoom/fuzz around this chunk.
+    #[must_use]
+    pub fn terrain_gen_biome_sampler(&self, chunk_x: i32, chunk_z: i32) -> MultiNoiseSampler<'_> {
+        let start_quart_x = biome_coords::from_chunk(chunk_x) - 1;
+        let start_quart_z = biome_coords::from_chunk(chunk_z) - 1;
+        let horizontal_biome_end = biome_coords::from_block(CHUNK_DIM as i32) as usize + 2;
+        let options = MultiNoiseSamplerBuilderOptions::new(
+            start_quart_x,
+            start_quart_z,
+            horizontal_biome_end,
+        );
+        MultiNoiseSampler::generate(&self.base_router.multi_noise, &options)
+    }
 }
 
 impl GeneratorInit for VanillaGenerator {

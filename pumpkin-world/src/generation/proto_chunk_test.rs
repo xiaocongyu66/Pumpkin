@@ -1,8 +1,11 @@
 #[cfg(test)]
 mod test {
+    use crate::biome::BiomeSupplier;
     use crate::chunk_system::chunk_state::StagedChunkEnum;
-    use crate::generation::{generator::WorldGenerator, get_world_gen, proto_chunk::ProtoChunk};
-    use pumpkin_data::dimension::Dimension;
+    use crate::generation::{
+        biome::get_biome_blend, generator::WorldGenerator, get_world_gen, proto_chunk::ProtoChunk,
+    };
+    use pumpkin_data::{chunk::Biome, dimension::Dimension};
     use pumpkin_util::world_seed::Seed;
 
     #[test]
@@ -103,6 +106,67 @@ mod test {
             has_surface_blocks,
             "Top of the world must contain surface blocks (grass/dirt/sand/water)"
         );
+    }
+
+    #[test]
+    fn surface_biome_resolver_uses_global_neighbor_quart() {
+        let world_gen = get_world_gen(
+            Seed(0),
+            Dimension::OVERWORLD,
+            false,
+            Vec::new(),
+            String::new(),
+        );
+        let WorldGenerator::Noise(generator) = &*world_gen else {
+            unreachable!()
+        };
+
+        // `BiomeManager#getBiome` can select X=-1 for this column. The local
+        // chunk palette has no such quart; its old clamp would have returned the
+        // quart at X=0 instead of resolving the global source at X=-1.
+        let (x, y, z) = (0, 64, 5);
+        let selected_quart = get_biome_blend(
+            generator.dimension.min_y as i8,
+            generator.dimension.height as u16,
+            generator.biome_mixer_seed,
+            x,
+            y,
+            z,
+        );
+        assert_eq!(selected_quart.x, -1);
+
+        let mut sampler = generator.terrain_gen_biome_sampler(0, 0);
+        let expected = generator
+            .terrain_gen_biome_at_block(x, y, z, &mut sampler)
+            .id;
+
+        let local_fallback = if expected == Biome::BADLANDS.id {
+            Biome::PLAINS.id
+        } else {
+            Biome::BADLANDS.id
+        };
+        let mut local_chunk = ProtoChunk::new(0, 0, &world_gen);
+        local_chunk.flat_biome_map.fill(local_fallback);
+        assert_eq!(
+            local_chunk.get_terrain_gen_biome_id(x, y, z),
+            local_fallback
+        );
+        assert_ne!(
+            expected, local_fallback,
+            "the global resolver must not substitute the current chunk's palette"
+        );
+
+        // Independently sample the selected quart to prove the resolver did not
+        // substitute the current chunk's palette at the boundary.
+        let expected_quart_biome = crate::biome::MultiNoiseBiomeSupplier::OVERWORLD
+            .biome(
+                selected_quart.x,
+                selected_quart.y,
+                selected_quart.z,
+                &mut sampler,
+            )
+            .id;
+        assert_eq!(expected, expected_quart_biome);
     }
 
     #[test]

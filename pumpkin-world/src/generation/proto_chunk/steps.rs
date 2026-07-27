@@ -398,9 +398,15 @@ impl ProtoChunk {
         cache.get_center_chunk_mut().stage = StagedChunkEnum::Spawn;
     }
 
+    /// Resolves a terrain biome through this proto chunk's persisted palette.
+    ///
+    /// The biome zoom/fuzz can select a neighboring quart, but this storage has
+    /// no neighbor palette. Keep this local fallback clamped so it cannot wrap
+    /// to the far side of this chunk. Surface material generation instead uses
+    /// `VanillaGenerator::terrain_gen_biome_at_block`, which resolves globally.
     #[must_use]
     pub fn get_terrain_gen_biome_id(&self, x: i32, y: i32, z: i32) -> u8 {
-        let seed_biome_pos = biome::get_biome_blend(
+        let quart = biome::get_biome_blend(
             self.bottom_y(),
             self.height(),
             self.biome_mixer_seed,
@@ -408,26 +414,13 @@ impl ProtoChunk {
             y,
             z,
         );
-
-        // The biome-zoom fuzz can pick a quart up to one quart outside this chunk.
-        // Vanilla resolves such positions through the whole region
-        // (SurfaceRules.java:754-758, biomeGetter backed by BiomeManager), but only
-        // this chunk's biome storage is available here, so clamp to the chunk edge.
-        // Without this, `get_biome_id`'s `& 3` wrap resolved an unrelated column on
-        // the far side of the chunk (sand/terracotta speckling at chunk borders).
-        // Residual gap vs vanilla: a border quart fuzzed into a neighbor chunk uses
-        // the nearest in-chunk quart instead of the true neighbor quart.
         let min_quart_x = biome_coords::from_block(start_block_x(self.x));
         let min_quart_z = biome_coords::from_block(start_block_z(self.z));
         let max_quart_offset = biome_coords::from_block(15);
-        let quart_x = seed_biome_pos
-            .x
-            .clamp(min_quart_x, min_quart_x + max_quart_offset);
-        let quart_z = seed_biome_pos
-            .z
-            .clamp(min_quart_z, min_quart_z + max_quart_offset);
+        let quart_x = quart.x.clamp(min_quart_x, min_quart_x + max_quart_offset);
+        let quart_z = quart.z.clamp(min_quart_z, min_quart_z + max_quart_offset);
 
-        self.get_biome_id(quart_x, seed_biome_pos.y, quart_z)
+        self.get_biome_id(quart_x, quart.y, quart_z)
     }
 
     #[must_use]
@@ -459,6 +452,10 @@ impl ProtoChunk {
             &terrain_cache.secondary_noise,
             settings.sea_level,
         );
+        // Vanilla `BiomeManager#getBiome` may select a neighboring quart at a
+        // chunk edge. Resolve it from the generator's global source rather than
+        // masking or clamping it into this chunk's palette.
+        let mut biome_sampler = generator.terrain_gen_biome_sampler(self.x, self.z);
         for local_x in 0..16 {
             for local_z in 0..16 {
                 let x = start_x + local_x;
@@ -472,7 +469,9 @@ impl ProtoChunk {
                     top_block
                 };
 
-                let this_biome = self.get_terrain_gen_biome_id(x, biome_y, z);
+                let this_biome = generator
+                    .terrain_gen_biome_at_block(x, biome_y, z, &mut biome_sampler)
+                    .id;
                 if this_biome == Biome::ERODED_BADLANDS {
                     terrain_cache
                         .terrain_builder
@@ -531,10 +530,11 @@ impl ProtoChunk {
                     context.init_vertical(stone_depth_above, stone_depth_below, y, fluid_height);
 
                     if state.id == self.default_block.id {
-                        context.biome = self.get_terrain_gen_biome(
+                        context.biome = generator.terrain_gen_biome_at_block(
                             context.block_pos_x,
                             context.block_pos_y,
                             context.block_pos_z,
+                            &mut biome_sampler,
                         );
                         let new_state = try_apply_material_rule(
                             &settings.surface_rule,
