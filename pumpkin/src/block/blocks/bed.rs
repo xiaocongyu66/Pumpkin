@@ -6,9 +6,12 @@ use pumpkin_data::BlockStateId;
 use pumpkin_data::block_properties::BedPart;
 use pumpkin_data::block_properties::BlockProperties;
 use pumpkin_data::dimension::Dimension;
-use pumpkin_data::entity::EntityType;
+use pumpkin_data::entity::{EntityPose, EntityType};
+use pumpkin_data::meta_data_type::MetaDataType;
+use pumpkin_data::tracked_data::TrackedData;
 use pumpkin_data::translation;
 use pumpkin_macros::pumpkin_block_from_tag;
+use pumpkin_protocol::java::client::play::Metadata;
 use pumpkin_util::GameMode;
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::text::TextComponent;
@@ -241,6 +244,29 @@ impl BlockBehaviour for BedBlock {
                 return BlockActionResult::SuccessServer;
             }
 
+            // Vanilla BedBlock.java:160-180: wake a sleeping villager in the bed first.
+            if bed_props.occupied {
+                if Self::kick_villager_out_of_bed(args.world, &bed_head_pos) {
+                    let (bed_block, bed_state_id) =
+                        args.world.get_block_and_state_id(&bed_head_pos);
+                    Self::set_occupied(false, args.world, bed_block, &bed_head_pos, bed_state_id)
+                        .await;
+                    return BlockActionResult::SuccessServer;
+                }
+
+                args.player
+                    .send_system_message_raw(
+                        &TextComponent::translate_cross(
+                            translation::java::BLOCK_MINECRAFT_BED_OCCUPIED,
+                            translation::bedrock::TILE_BED_OCCUPIED,
+                            [],
+                        ),
+                        true,
+                    )
+                    .await;
+                return BlockActionResult::SuccessServer;
+            }
+
             // Make sure the bed is not obstructed
             if args.world.get_block_state(&bed_head_pos.up()).is_solid()
                 || args.world.get_block_state(&bed_foot_pos.up()).is_solid()
@@ -250,23 +276,6 @@ impl BlockBehaviour for BedBlock {
                         &TextComponent::translate_cross(
                             translation::java::BLOCK_MINECRAFT_BED_OBSTRUCTED,
                             translation::java::BLOCK_MINECRAFT_BED_OBSTRUCTED,
-                            [],
-                        ),
-                        true,
-                    )
-                    .await;
-                return BlockActionResult::SuccessServer;
-            }
-
-            // Make sure the bed is not occupied
-            if bed_props.occupied {
-                // TODO: Wake up villager
-
-                args.player
-                    .send_system_message_raw(
-                        &TextComponent::translate_cross(
-                            translation::java::BLOCK_MINECRAFT_BED_OCCUPIED,
-                            translation::bedrock::TILE_BED_OCCUPIED,
                             [],
                         ),
                         true,
@@ -379,6 +388,44 @@ impl BlockBehaviour for BedBlock {
 }
 
 impl BedBlock {
+    /// Vanilla `BedBlock.kickVillagerOutOfBed` (26.2 CFR, lines 174-180).
+    ///
+    /// Pumpkin's villager sleep state retains the claimed bed head in `home_pos`,
+    /// so use it to identify the precise sleeper rather than a broad position scan.
+    fn kick_villager_out_of_bed(world: &World, bed_head_pos: &BlockPos) -> bool {
+        let entities = world.entities.load();
+        let Some(villager) = entities.iter().find(|entity| {
+            let base = entity.get_entity();
+            is_sleeping_villager_in_bed(
+                base.entity_type,
+                base.pose.load(),
+                entity.get_home_pos(),
+                *bed_head_pos,
+            )
+        }) else {
+            return false;
+        };
+
+        let entity = villager.get_entity();
+        entity.set_pose(EntityPose::Standing);
+        entity.send_meta_data(
+            &[
+                Metadata::new(
+                    TrackedData::SLEEPING_POSITION,
+                    MetaDataType::OPTIONAL_BLOCK_POS,
+                    None::<BlockPos>,
+                ),
+                Metadata::new(
+                    TrackedData::SLEEPING_POS_ID,
+                    MetaDataType::OPTIONAL_BLOCK_POS,
+                    None::<BlockPos>,
+                ),
+            ],
+            None,
+        );
+        true
+    }
+
     pub async fn set_occupied(
         occupied: bool,
         world: &Arc<World>,
@@ -416,6 +463,18 @@ impl BedBlock {
     }
 }
 
+/// Identifies the current Pumpkin equivalent of Vanilla's sleeping villager at a bed.
+fn is_sleeping_villager_in_bed(
+    entity_type: &EntityType,
+    pose: EntityPose,
+    home_pos: Option<BlockPos>,
+    bed_head_pos: BlockPos,
+) -> bool {
+    entity_type == &EntityType::VILLAGER
+        && pose == EntityPose::Sleeping
+        && home_pos == Some(bed_head_pos)
+}
+
 async fn can_sleep(world: &Arc<World>) -> bool {
     let time = world.level_time.lock().await;
     let weather = world.weather.lock().await;
@@ -431,4 +490,50 @@ async fn can_sleep(world: &Arc<World>) -> bool {
 
 fn entity_prevents_sleep(entity: &Entity) -> bool {
     NO_SLEEP_IDS.contains(&entity.entity_type.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BED_HEAD: BlockPos = BlockPos::new(12, 64, -4);
+    const OTHER_BED_HEAD: BlockPos = BlockPos::new(13, 64, -4);
+
+    #[test]
+    fn sleeping_villager_in_matching_bed_is_selected() {
+        assert!(is_sleeping_villager_in_bed(
+            &EntityType::VILLAGER,
+            EntityPose::Sleeping,
+            Some(BED_HEAD),
+            BED_HEAD,
+        ));
+    }
+
+    #[test]
+    fn wakeup_selection_excludes_other_entity_states_and_beds() {
+        assert!(!is_sleeping_villager_in_bed(
+            &EntityType::VILLAGER,
+            EntityPose::Standing,
+            Some(BED_HEAD),
+            BED_HEAD,
+        ));
+        assert!(!is_sleeping_villager_in_bed(
+            &EntityType::ZOMBIE_VILLAGER,
+            EntityPose::Sleeping,
+            Some(BED_HEAD),
+            BED_HEAD,
+        ));
+        assert!(!is_sleeping_villager_in_bed(
+            &EntityType::VILLAGER,
+            EntityPose::Sleeping,
+            Some(OTHER_BED_HEAD),
+            BED_HEAD,
+        ));
+        assert!(!is_sleeping_villager_in_bed(
+            &EntityType::VILLAGER,
+            EntityPose::Sleeping,
+            None,
+            BED_HEAD,
+        ));
+    }
 }
