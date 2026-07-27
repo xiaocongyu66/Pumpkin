@@ -6,7 +6,7 @@ use pumpkin_data::structures::{Structure, StructurePlacementType, StructureSet, 
 use pumpkin_data::tag::{RegistryKey, get_tag_ids};
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::random::{
-    RandomGenerator, RandomImpl, get_carver_seed, get_decorator_seed, xoroshiro128::Xoroshiro,
+    RandomGenerator, RandomImpl, get_decorator_seed, xoroshiro128::Xoroshiro,
 };
 
 use crate::biome::{BiomeSupplier, MultiNoiseBiomeSupplier, end::TheEndBiomeSupplier};
@@ -14,7 +14,7 @@ use crate::chunk_system::StagedChunkEnum;
 use crate::generation::structure::lazily_generate_structure;
 use crate::generation::structure::placement::should_generate_structure;
 use crate::generation::structure::structures::{
-    StructureGeneratorContext, StructureInstance, create_chunk_random,
+    StructureGeneratorContext, StructureInstance, StructurePosition, create_chunk_random,
 };
 use crate::generation::structure::try_generate_structure;
 use crate::generation::{
@@ -27,6 +27,63 @@ use crate::generation::{
 use crate::world::WorldPortalExt;
 
 use super::{ActiveSupplier, GenerationCache, ProtoChunk};
+
+/// Selects a structure-set entry using Vanilla's `ChunkGenerator.createStructures`
+/// weighted fallback order (`/root/Vanilla/src/net/minecraft/world/level/chunk/
+/// ChunkGenerator.java:405-427`).
+///
+/// Multi-entry sets use `WorldgenRandom(new LegacyRandomSource(0))` seeded by
+/// `setLargeFeatureSeed(seed, chunk_x, chunk_z)`
+/// (`/root/Vanilla/src/net/minecraft/world/level/levelgen/WorldgenRandom.java:69-75`),
+/// which is the same Legacy RNG returned by `create_chunk_random`. Failed
+/// candidates are removed and the next bounded draw uses the remaining total
+/// weight. Single-entry sets bypass this selection RNG entirely, as Vanilla does.
+fn try_select_structure_set_entry<'a, T>(
+    entries: &'a [WeightedEntry],
+    seed: i64,
+    chunk_x: i32,
+    chunk_z: i32,
+    mut try_entry: impl FnMut(&'a WeightedEntry) -> Option<T>,
+) -> Option<(&'a WeightedEntry, T)> {
+    match entries {
+        [] => None,
+        [entry] => try_entry(entry).map(|result| (entry, result)),
+        _ => {
+            let mut candidates: Vec<&WeightedEntry> = entries.iter().collect();
+            let mut random = create_chunk_random(seed, chunk_x, chunk_z);
+            let mut total_weight = candidates.iter().fold(0u32, |total, entry| {
+                total
+                    .checked_add(entry.weight)
+                    .expect("structure-set total weight fits in u32")
+            });
+
+            while !candidates.is_empty() {
+                let mut choice = random.next_bounded_i32(
+                    i32::try_from(total_weight).expect("structure-set total weight fits in i32"),
+                );
+                let mut selected_index = 0;
+
+                for (index, entry) in candidates.iter().enumerate() {
+                    choice -= i32::try_from(entry.weight)
+                        .expect("structure-set entry weight fits in i32");
+                    if choice < 0 {
+                        selected_index = index;
+                        break;
+                    }
+                }
+
+                let selected = candidates[selected_index];
+                if let Some(result) = try_entry(selected) {
+                    return Some((selected, result));
+                }
+
+                total_weight -= candidates.remove(selected_index).weight;
+            }
+
+            None
+        }
+    }
+}
 
 impl ProtoChunk {
     pub fn generate_features_and_structure<T: GenerationCache>(
@@ -219,12 +276,11 @@ impl ProtoChunk {
         let calculator = &generator.structure_calculator;
 
         let seed = random_config.seed;
-
         let mut height_sampler = crate::generation::noise::router::surface_height_sampler::SurfaceHeightEstimateSampler::generate(
             &generator.base_router.surface_estimator,
             &crate::generation::noise::router::surface_height_sampler::SurfaceHeightSamplerBuilderOptions::new(
-                crate::generation::biome_coords::from_block(crate::generation::positions::chunk_pos::start_block_x(self.x)),
-                crate::generation::biome_coords::from_block(crate::generation::positions::chunk_pos::start_block_z(self.z)),
+                crate::generation::biome_coords::from_block(chunk_pos::start_block_x(self.x)),
+                crate::generation::biome_coords::from_block(chunk_pos::start_block_z(self.z)),
                 4,
                 settings.shape.min_y as i32,
                 settings.shape.height as i32,
@@ -247,78 +303,42 @@ impl ProtoChunk {
                 continue;
             }
 
-            if set.structures.len() == 1 {
-                if let Some(entry) = set.structures.first() {
-                    self.try_set_structure_start(
+            if let Some((entry, position)) = try_select_structure_set_entry(
+                set.structures,
+                seed as i64,
+                self.x,
+                self.z,
+                |entry| {
+                    self.try_generate_structure_start(
                         settings.sea_level,
                         entry,
                         random_config,
                         &mut height_sampler,
-                    );
-                }
-                continue;
-            }
-
-            let mut candidates = set.structures.to_vec();
-            let carver_seed = get_carver_seed(seed, self.x, self.z);
-            let mut random: RandomGenerator =
-                RandomGenerator::Xoroshiro(Xoroshiro::from_seed(carver_seed));
-
-            let mut total_weight: u32 = candidates.iter().map(|e| e.weight).sum();
-
-            while !candidates.is_empty() {
-                let mut roll = random.next_bounded_i32(total_weight as i32);
-                let mut selected_idx = 0;
-
-                for (i, entry) in candidates.iter().enumerate() {
-                    roll -= entry.weight as i32;
-                    if roll < 0 {
-                        selected_idx = i;
-                        break;
-                    }
-                }
-
-                let selected_entry = &candidates[selected_idx];
-
-                if self.try_set_structure_start(
-                    settings.sea_level,
-                    selected_entry,
-                    random_config,
-                    &mut height_sampler,
-                ) {
-                    break;
-                }
-
-                let failed_entry = candidates.remove(selected_idx);
-                total_weight -= failed_entry.weight;
+                    )
+                },
+            ) {
+                self.structure_starts
+                    .insert(entry.structure, StructureInstance::Start(position));
             }
         }
         self.stage = StagedChunkEnum::StructureStart;
     }
 
-    fn try_set_structure_start(
-        &mut self,
+    fn try_generate_structure_start(
+        &self,
         sea_level: i32,
         entry: &WeightedEntry,
         random_config: &GlobalRandomConfig,
         height_sampler: &mut crate::generation::noise::router::surface_height_sampler::SurfaceHeightEstimateSampler<'_>,
-    ) -> bool {
-        let structure = Structure::get(&entry.structure);
-        let position = try_generate_structure(
+    ) -> Option<StructurePosition> {
+        try_generate_structure(
             &entry.structure,
-            structure,
+            Structure::get(&entry.structure),
             random_config.seed as i64,
             self,
             sea_level,
             Some(height_sampler),
-        );
-
-        if let Some(pos) = position {
-            self.structure_starts
-                .insert(entry.structure, StructureInstance::Start(pos));
-            return true;
-        }
-        false
+        )
     }
 
     #[expect(clippy::too_many_lines)]
@@ -371,8 +391,6 @@ impl ProtoChunk {
         );
 
         let mut references = Vec::new();
-        // Constant across every chunk in the dimension, so hoist it out of the loop
-        // and out of the (cached) structure-start computation below.
         let chunk_min_y = self.bottom_y() as i32;
         let calculator = &generator.structure_calculator;
 
@@ -449,51 +467,53 @@ impl ProtoChunk {
                     ) {
                         continue;
                     }
-                    for entry in set.structures {
-                        let structure = Structure::get(&entry.structure);
+                    if let Some((entry, start_data)) = try_select_structure_set_entry(
+                        set.structures,
+                        seed,
+                        candidate_chunk_x,
+                        candidate_chunk_z,
+                        |entry| {
+                            let structure = Structure::get(&entry.structure);
 
-                        // A structure's placement depends only on its start chunk and the
-                        // world seed, so cache it: otherwise every surrounding chunk whose
-                        // references overlap it would re-run the (expensive) jigsaw
-                        // expansion. `context` is only built on a cache miss.
-                        let start_data = global_cache.get_or_compute_structure_start(
-                            entry.structure,
-                            candidate_chunk_x,
-                            candidate_chunk_z,
-                            || {
-                                let context = StructureGeneratorContext {
-                                    seed,
-                                    chunk_x: candidate_chunk_x,
-                                    chunk_z: candidate_chunk_z,
-                                    random: create_chunk_random(
+                            // A structure's placement depends only on its start chunk and the
+                            // world seed, so cache it: otherwise every surrounding chunk whose
+                            // references overlap it would re-run the (expensive) jigsaw
+                            // expansion. `context` is only built on a cache miss.
+                            global_cache.get_or_compute_structure_start(
+                                entry.structure,
+                                candidate_chunk_x,
+                                candidate_chunk_z,
+                                || {
+                                    let context = StructureGeneratorContext {
                                         seed,
-                                        candidate_chunk_x,
-                                        candidate_chunk_z,
-                                    ),
-                                    sea_level: settings.sea_level,
-                                    min_y: chunk_min_y,
-                                    max_y: chunk_min_y + self.height() as i32 - 1,
-                                    height_sampler: Some(&mut height_sampler),
-                                    structure_key: Some(entry.structure),
-                                };
-                                lazily_generate_structure(
-                                    &entry.structure,
-                                    structure,
-                                    context,
-                                    &biome_supplier,
-                                    &mut multi_noise_sampler,
-                                )
-                            },
-                        );
-
-                        if let Some(start_data) = start_data
-                            && start_data
-                                .get_bounding_box()
-                                .intersects_raw_xz(start_x, start_z, end_x, end_z)
-                        {
-                            references.push((entry.structure, start_data.collector.clone()));
-                            break;
-                        }
+                                        chunk_x: candidate_chunk_x,
+                                        chunk_z: candidate_chunk_z,
+                                        random: create_chunk_random(
+                                            seed,
+                                            candidate_chunk_x,
+                                            candidate_chunk_z,
+                                        ),
+                                        sea_level: settings.sea_level,
+                                        min_y: chunk_min_y,
+                                        max_y: chunk_min_y + self.height() as i32 - 1,
+                                        height_sampler: Some(&mut height_sampler),
+                                        structure_key: Some(entry.structure),
+                                    };
+                                    lazily_generate_structure(
+                                        &entry.structure,
+                                        structure,
+                                        context,
+                                        &biome_supplier,
+                                        &mut multi_noise_sampler,
+                                    )
+                                },
+                            )
+                        },
+                    ) && start_data
+                        .get_bounding_box()
+                        .intersects_raw_xz(start_x, start_z, end_x, end_z)
+                    {
+                        references.push((entry.structure, start_data.collector.clone()));
                     }
                 }
             }
@@ -506,5 +526,62 @@ impl ProtoChunk {
         }
 
         self.stage = StagedChunkEnum::StructureReferences;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pumpkin_data::structures::{StructureKeys, StructureSet};
+
+    use super::try_select_structure_set_entry;
+
+    #[test]
+    fn multi_entry_selection_uses_vanilla_large_feature_seed() {
+        let (entry, ()) = try_select_structure_set_entry(
+            StructureSet::MINESHAFTS.structures,
+            123_456_789,
+            -37,
+            84,
+            |_| Some(()),
+        )
+        .expect("a mineshaft variant is selected");
+
+        // Vanilla WorldgenRandom(LegacyRandomSource) seeded with
+        // setLargeFeatureSeed(123456789, -37, 84) first returns nextInt(2) == 1
+        // (`WorldgenRandom.java:69-75`, `ChunkGenerator.java:405-427`).
+        assert_eq!(entry.structure, StructureKeys::MineshaftMesa);
+    }
+
+    #[test]
+    fn multi_entry_selection_retries_without_replacement() {
+        let (entry, ()) = try_select_structure_set_entry(
+            StructureSet::MINESHAFTS.structures,
+            123_456_789,
+            -37,
+            84,
+            |entry| (entry.structure == StructureKeys::Mineshaft).then_some(()),
+        )
+        .expect("the fallback mineshaft variant succeeds");
+
+        assert_eq!(entry.structure, StructureKeys::Mineshaft);
+    }
+
+    #[test]
+    fn owner_and_reference_selection_match_for_multi_entry_set() {
+        let choose = || {
+            try_select_structure_set_entry(
+                StructureSet::NETHER_COMPLEXES.structures,
+                987_654_321,
+                12,
+                -15,
+                |entry| (entry.structure == StructureKeys::BastionRemnant).then_some(()),
+            )
+            .map(|(entry, ())| entry.structure)
+        };
+
+        // The owner start and a reference recomputation both invoke the same helper
+        // with the start chunk coordinates, so they cannot drift to static entry order.
+        assert_eq!(choose(), Some(StructureKeys::BastionRemnant));
+        assert_eq!(choose(), Some(StructureKeys::BastionRemnant));
     }
 }
