@@ -113,9 +113,9 @@ impl VanillaGenerator {
         }
     }
 
-    /// Builds a sampler whose FlatCache covers the one-quart fuzzy halo around
+    /// Builds a sampler whose `FlatCache` covers the one-quart fuzzy halo around
     /// the surface/carver chunk. Positions beyond that halo safely take
-    /// MultiNoiseSampler's uncached path; no scheduler or write radius changes
+    /// `MultiNoiseSampler`'s uncached path; no scheduler or write radius changes
     /// are implied by this phase-one resolver.
     #[must_use]
     pub fn terrain_gen_biome_sampler(&self, chunk_x: i32, chunk_z: i32) -> MultiNoiseSampler<'_> {
