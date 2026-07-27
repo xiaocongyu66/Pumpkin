@@ -614,6 +614,14 @@ mod tests {
             .count()
     }
 
+    /// Counts only the raiders emitted by the `RaiderType` table, excluding the
+    /// ravager passengers appended by `plan_wave`.
+    fn base_counts(plan: &[PlannedRaider], entity_type: &'static EntityType) -> usize {
+        plan.iter()
+            .filter(|raider| raider.rides_index.is_none() && raider.entity_type == entity_type)
+            .count()
+    }
+
     #[test]
     fn wave_one_normal_is_four_pillagers() {
         let plan = plan_wave(1, 5, false, Difficulty::Normal, no_bonus);
@@ -749,13 +757,17 @@ mod tests {
 
     #[test]
     fn bonus_wave_uses_the_final_column_and_can_add_a_ravager() {
-        // Hard bonus wave: default columns are index 7, and the ravager bonus
-        // applies only on a bonus wave (Raid.java:666).
-        let plan = plan_wave(99, 7, true, Difficulty::Hard, max_bonus);
+        // A hard bonus wave is group 8 (`groupsSpawned + 1`), but its defaults
+        // still read final-wave column 7. Its ravager bonus applies only on a
+        // bonus wave (Raid.java:458, 635-637, 666).
+        let plan = plan_wave(8, 7, true, Difficulty::Hard, max_bonus);
         // Wave-7 ravager column is 2, plus up to 1 bonus.
-        assert_eq!(counts(&plan, &EntityType::RAVAGER), 3);
+        assert_eq!(base_counts(&plan, &EntityType::RAVAGER), 3);
         // Wave-7 vindicator column is 5, plus up to 2 bonus.
-        assert_eq!(counts(&plan, &EntityType::VINDICATOR), 7);
+        assert_eq!(base_counts(&plan, &EntityType::VINDICATOR), 7);
+        // Group 8 is at/after the hard threshold. Vanilla adds an evoker to the
+        // first ravager and vindicators to the other two (Raid.java:473-484).
+        assert_eq!(counts(&plan, &EntityType::VINDICATOR), 9);
     }
 
     #[test]
