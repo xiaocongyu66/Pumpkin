@@ -581,14 +581,10 @@ impl PoiStorage {
     /// This is the storage counterpart of vanilla `PoiManager.exists`
     /// (`PoiManager.java:150-152`). A persisted type Pumpkin does not know is
     /// not a registered `PoiType`, so it cannot satisfy the predicate.
-    pub fn exists(
-        &mut self,
-        pos: &BlockPos,
-        mut type_predicate: impl FnMut(&PoiType) -> bool,
-    ) -> bool {
+    pub fn exists(&mut self, pos: &BlockPos, type_predicate: impl FnMut(&PoiType) -> bool) -> bool {
         self.get(pos)
             .and_then(|entry| types::by_name(&entry.poi_type))
-            .is_some_and(|poi_type| type_predicate(poi_type))
+            .is_some_and(type_predicate)
     }
 
     /// Tests whether `pos` contains the given registered POI type.
@@ -791,9 +787,7 @@ impl PoiStorage {
         mut type_predicate: impl FnMut(&PoiType) -> bool,
         mut filter: impl FnMut(&PoiType, BlockPos) -> bool,
     ) -> Option<BlockPos> {
-        let Some((min_x, max_x, min_z, max_z)) = Self::square_bounds(center, radius) else {
-            return None;
-        };
+        let (min_x, max_x, min_z, max_z) = Self::square_bounds(center, radius)?;
         let radius_squared = i64::from(radius) * i64::from(radius);
         let (min_rx, min_rz) = Self::region_coords(&BlockPos::new(min_x, center.0.y, min_z));
         let (max_rx, max_rz) = Self::region_coords(&BlockPos::new(max_x, center.0.y, max_z));
@@ -1092,7 +1086,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::similar_names)]
     fn square_and_range_queries_use_vanilla_boundaries() {
         let center = pos(0, 64, 0);
         let square_edge = pos(2, -128, 2);
