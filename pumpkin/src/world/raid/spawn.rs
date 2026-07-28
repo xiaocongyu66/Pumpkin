@@ -287,11 +287,13 @@ pub async fn tick_raid(world: &Arc<World>, raid: &Arc<Raid>) {
         prune_raiders(world, raid);
     }
 
-    // Raid.java:319-336 — spawn the scheduled waves, tracking failed attempts.
+    // Raid.java:319-336 — `advance` schedules the one possible successful spawn.
+    // If no position exists, vanilla retries the condition until the attempt budget
+    // is exhausted; a successful spawn adds raiders and ends its loop.
     if plan.waves_to_spawn > 0 {
-        let mut sound_played = false;
         let mut attempts = 0;
-        for _ in 0..plan.waves_to_spawn {
+        let mut spawned_wave = false;
+        loop {
             let center = raid.center();
             let cooldown = raid.with(|inner| inner.state.raid_cooldown_ticks);
             // Raid.java:322 — the cached position first, else a 20-try search.
@@ -299,15 +301,18 @@ pub async fn tick_raid(world: &Arc<World>, raid: &Arc<Raid>) {
                 .with(|inner| inner.wave_spawn_pos)
                 .or_else(|| find_random_spawn_pos(world, center, cooldown, 20));
 
-            if let Some(pos) = spawn_pos {
-                if spawn_wave(world, raid, &world.raids.raiders, pos).await && !sound_played {
-                    // Raid.java:326-329 — the horn plays once per tick.
-                    play_raid_horn(world, pos, &raid.bossbar_players());
-                    sound_played = true;
-                }
-            } else {
-                attempts += 1;
+            // Vanilla's `playedSound` guard only matters because its loop can
+            // spawn more than once; this port spawns at most one wave per tick,
+            // so the horn is unconditional here (Raid.java:326-329).
+            if let Some(pos) = spawn_pos
+                && spawn_wave(world, raid, &world.raids.raiders, pos).await
+            {
+                spawned_wave = true;
+                play_raid_horn(world, pos, &raid.bossbar_players());
+                break;
             }
+
+            attempts += 1;
             // Raid.java:333-335.
             if attempts > NUM_SPAWN_ATTEMPTS {
                 let players = raid.stop();
@@ -315,8 +320,10 @@ pub async fn tick_raid(world: &Arc<World>, raid: &Arc<Raid>) {
                 break;
             }
         }
-        // A wave changed the health denominator, so refresh the bar.
-        push_health_progress(world, raid).await;
+        if spawned_wave {
+            // A wave changed the health denominator, so refresh the bar.
+            push_health_progress(world, raid).await;
+        }
     }
 
     // Boss-bar pushes the plan asked for.
@@ -614,6 +621,14 @@ mod tests {
             .count()
     }
 
+    /// Counts only the raiders emitted by the `RaiderType` table, excluding the
+    /// ravager passengers appended by `plan_wave`.
+    fn base_counts(plan: &[PlannedRaider], entity_type: &'static EntityType) -> usize {
+        plan.iter()
+            .filter(|raider| raider.rides_index.is_none() && raider.entity_type == entity_type)
+            .count()
+    }
+
     #[test]
     fn wave_one_normal_is_four_pillagers() {
         let plan = plan_wave(1, 5, false, Difficulty::Normal, no_bonus);
@@ -749,13 +764,17 @@ mod tests {
 
     #[test]
     fn bonus_wave_uses_the_final_column_and_can_add_a_ravager() {
-        // Hard bonus wave: default columns are index 7, and the ravager bonus
-        // applies only on a bonus wave (Raid.java:666).
-        let plan = plan_wave(99, 7, true, Difficulty::Hard, max_bonus);
+        // A hard bonus wave is group 8 (`groupsSpawned + 1`), but its defaults
+        // still read final-wave column 7. Its ravager bonus applies only on a
+        // bonus wave (Raid.java:458, 635-637, 666).
+        let plan = plan_wave(8, 7, true, Difficulty::Hard, max_bonus);
         // Wave-7 ravager column is 2, plus up to 1 bonus.
-        assert_eq!(counts(&plan, &EntityType::RAVAGER), 3);
+        assert_eq!(base_counts(&plan, &EntityType::RAVAGER), 3);
         // Wave-7 vindicator column is 5, plus up to 2 bonus.
-        assert_eq!(counts(&plan, &EntityType::VINDICATOR), 7);
+        assert_eq!(base_counts(&plan, &EntityType::VINDICATOR), 7);
+        // Group 8 is at/after the hard threshold. Vanilla adds an evoker to the
+        // first ravager and vindicators to the other two (Raid.java:473-484).
+        assert_eq!(counts(&plan, &EntityType::VINDICATOR), 9);
     }
 
     #[test]
