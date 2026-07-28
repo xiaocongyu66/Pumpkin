@@ -823,6 +823,27 @@ impl PoiStorage {
         None
     }
 
+    /// Finds and claims one matching POI using an exact stored type name.
+    ///
+    /// Use [`Self::take_by`] when the caller needs a vanilla-style type
+    /// predicate. This wrapper keeps filtering and ticket acquisition inside the
+    /// same storage operation.
+    #[must_use]
+    pub fn take(
+        &mut self,
+        center: BlockPos,
+        radius: i32,
+        poi_type: Option<&str>,
+        mut filter: impl FnMut(&str, BlockPos) -> bool,
+    ) -> Option<BlockPos> {
+        self.take_by(
+            center,
+            radius,
+            |registered_type| poi_type.is_none_or(|type_name| registered_type.name == type_name),
+            |registered_type, pos| filter(registered_type.name, pos),
+        )
+    }
+
     fn query_entries_in_square(
         &mut self,
         center: BlockPos,
@@ -975,22 +996,12 @@ mod tests {
         assert!(storage.add(home, "minecraft:home"));
 
         assert_eq!(
-            storage.take_by(
-                home,
-                0,
-                |poi_type| poi_type.name == "minecraft:home",
-                |_, _| true,
-            ),
+            storage.take(home, 0, Some("minecraft:home"), |_, _| true),
             Some(home)
         );
         assert_eq!(storage.get(&home).map(|entry| entry.free_tickets), Some(0));
         assert_eq!(
-            storage.take_by(
-                home,
-                0,
-                |poi_type| poi_type.name == "minecraft:home",
-                |_, _| true,
-            ),
+            storage.take(home, 0, Some("minecraft:home"), |_, _| true),
             None
         );
         assert_eq!(storage.release(&home), Some(true));
