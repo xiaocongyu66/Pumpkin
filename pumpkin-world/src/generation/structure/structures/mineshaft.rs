@@ -25,7 +25,7 @@ use pumpkin_util::{
 use crate::{
     ProtoChunk,
     generation::{
-        biome_coords,
+        biome_coords, diagnostics,
         positions::chunk_pos::{get_center_x, start_block_x, start_block_z},
         structure::{
             piece::StructurePieceType,
@@ -125,7 +125,9 @@ impl StructureGenerator for MineshaftGenerator {
             mineshaft_type,
         };
         // builder.addPiece(room); room.addChildren(room, builder, random) (l.64-65).
+        diagnostics::mineshaft_begin();
         add_children(&mut pieces, 0, start, &mut random);
+        let piece_count = pieces.len();
 
         let mut collector = StructurePiecesCollector::default();
         for piece in pieces {
@@ -161,6 +163,8 @@ impl StructureGenerator for MineshaftGenerator {
             // l.75: builder.moveBelowSeaLevel(seaLevel, minY, random, 10).
             collector.shift_into(context.sea_level, context.min_y, &mut random, 10)
         };
+
+        diagnostics::mineshaft_finished(context.chunk_x, context.chunk_z, piece_count, y_offset);
 
         // findGenerationPoint (l.53-56): (middleBlockX, 50, minBlockZ) + yOffset.
         Some(StructurePosition {
@@ -244,13 +248,22 @@ fn generate_and_add_piece(
 ) -> Option<usize> {
     // l.80: recursion depth limit.
     if depth > MAX_DEPTH {
+        diagnostics::mineshaft_depth_truncated();
         return None;
     }
     // l.83: stay within 80 blocks of the start piece corner.
     if (x - start.min_x).abs() > 80 || (z - start.min_z).abs() > 80 {
+        diagnostics::mineshaft_range_truncated();
         return None;
     }
-    let index = create_random_shaft_piece(pieces, random, x, y, z, direction, depth + 1, start)?;
+    let Some(index) =
+        create_random_shaft_piece(pieces, random, x, y, z, direction, depth + 1, start)
+    else {
+        // Every `None` from here is a piece that could not be fitted: the box
+        // collided with an already placed piece, or no corridor length fit.
+        diagnostics::mineshaft_collision_truncated();
+        return None;
+    };
     // l.89-90: addPiece happened inside create_random_shaft_piece; now recurse.
     add_children(pieces, index, start, random);
     Some(index)

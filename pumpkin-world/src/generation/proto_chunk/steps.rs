@@ -15,6 +15,7 @@ use crate::generation::surface::rule::try_apply_material_rule;
 use crate::generation::{
     biome, biome_coords,
     blender::{Blender, BlenderImpl},
+    diagnostics,
     noise::router::{
         multi_noise_sampler::MultiNoiseSampler,
         surface_height_sampler::SurfaceHeightEstimateSampler,
@@ -426,6 +427,17 @@ impl ProtoChunk {
         let quart_z = seed_biome_pos
             .z
             .clamp(min_quart_z, min_quart_z + max_quart_offset);
+
+        if quart_x != seed_biome_pos.x || quart_z != seed_biome_pos.z {
+            diagnostics::biome_quart_clamped(
+                self.x,
+                self.z,
+                seed_biome_pos.x,
+                seed_biome_pos.z,
+                quart_x,
+                quart_z,
+            );
+        }
 
         self.get_biome_id(quart_x, seed_biome_pos.y, quart_z)
     }
