@@ -291,7 +291,6 @@ pub async fn tick_raid(world: &Arc<World>, raid: &Arc<Raid>) {
     // If no position exists, vanilla retries the condition until the attempt budget
     // is exhausted; a successful spawn adds raiders and ends its loop.
     if plan.waves_to_spawn > 0 {
-        let mut sound_played = false;
         let mut attempts = 0;
         let mut spawned_wave = false;
         loop {
@@ -302,16 +301,15 @@ pub async fn tick_raid(world: &Arc<World>, raid: &Arc<Raid>) {
                 .with(|inner| inner.wave_spawn_pos)
                 .or_else(|| find_random_spawn_pos(world, center, cooldown, 20));
 
-            if let Some(pos) = spawn_pos {
-                if spawn_wave(world, raid, &world.raids.raiders, pos).await {
-                    spawned_wave = true;
-                    if !sound_played {
-                        // Raid.java:326-329 — the horn plays once per tick.
-                        play_raid_horn(world, pos, &raid.bossbar_players());
-                        sound_played = true;
-                    }
-                    break;
-                }
+            // Vanilla's `playedSound` guard only matters because its loop can
+            // spawn more than once; this port spawns at most one wave per tick,
+            // so the horn is unconditional here (Raid.java:326-329).
+            if let Some(pos) = spawn_pos
+                && spawn_wave(world, raid, &world.raids.raiders, pos).await
+            {
+                spawned_wave = true;
+                play_raid_horn(world, pos, &raid.bossbar_players());
+                break;
             }
 
             attempts += 1;

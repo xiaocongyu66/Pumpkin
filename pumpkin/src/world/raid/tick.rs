@@ -263,10 +263,6 @@ impl Raid {
         self.with(|inner| Self::advance_locked(inner, facts))
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one-to-one port of Raid.tick; splitting it would obscure the vanilla ordering"
-    )]
     fn advance_locked(inner: &mut RaidInner, facts: &WorldFacts) -> TickPlan {
         let mut plan = TickPlan::default();
 
