@@ -1091,18 +1091,33 @@ mod tests {
         let square_edge = pos(2, -128, 2);
         let circle_edge = pos(3, 64, 4);
         let outside_range_y = pos(0, 70, 0);
-        let outside_square = pos(3, 64, 0);
+        let outside_square_inside_range = pos(3, 64, 0);
         let (_temp_dir, mut storage) = test_storage();
-        for entry in [square_edge, circle_edge, outside_range_y, outside_square] {
+        for entry in [
+            square_edge,
+            circle_edge,
+            outside_range_y,
+            outside_square_inside_range,
+        ] {
             assert!(storage.add(entry, "minecraft:home"));
         }
 
+        // The square query ignores Y and uses an inclusive |dx|/|dz| <= radius
+        // bound, so the deep `square_edge` stays in and the x=3 records drop out
+        // (`PoiManager.getInSquare`, `PoiManager.java:88-94`).
         let square =
             storage.get_in_square_with_occupancy(center, 2, Some("minecraft:home"), Occupancy::Any);
         assert_eq!(square, vec![outside_range_y, square_edge]);
+        // The range query is the radius-5 square filtered by an inclusive 3D
+        // `distSqr <= radius * radius` (`PoiManager.getInRange`,
+        // `PoiManager.java:96-99`). `circle_edge` sits exactly on the boundary
+        // (25 == 25), `outside_square_inside_range` is well inside it at 9,
+        // while `outside_range_y` (36) and `square_edge` (36872) are out on Y
+        // alone. Results come back in the storage's deterministic
+        // type/x/y/z order.
         assert_eq!(
             storage.get_in_range(center, 5, Some("minecraft:home")),
-            vec![circle_edge]
+            vec![outside_square_inside_range, circle_edge]
         );
     }
 
