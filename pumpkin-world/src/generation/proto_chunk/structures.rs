@@ -11,6 +11,7 @@ use pumpkin_util::random::{
 
 use crate::biome::{BiomeSupplier, MultiNoiseBiomeSupplier, end::TheEndBiomeSupplier};
 use crate::chunk_system::StagedChunkEnum;
+use crate::generation::diagnostics;
 use crate::generation::structure::lazily_generate_structure;
 use crate::generation::structure::placement::should_generate_structure;
 use crate::generation::structure::structures::{
@@ -58,8 +59,14 @@ impl ProtoChunk {
         let population_seed =
             Xoroshiro::get_population_seed(random_config.seed, start_block_x, start_block_z);
 
+        let diagnose = diagnostics::enabled();
+
         for step in 0..11 {
-            Self::generate_structure_step(
+            // `Instant::now` is only taken in development mode; the release path
+            // keeps the plain call.
+            let step_started = diagnose.then(std::time::Instant::now);
+
+            let collectors = Self::generate_structure_step(
                 cache,
                 block_registry,
                 step,
@@ -98,18 +105,30 @@ impl ProtoChunk {
                     );
                 }
             }
+
+            if let Some(started) = step_started {
+                diagnostics::feature_step_slow(
+                    center_x,
+                    center_z,
+                    step,
+                    collectors,
+                    started.elapsed().as_millis(),
+                );
+            }
         }
 
         cache.get_center_chunk_mut().stage = StagedChunkEnum::Features;
     }
 
+    /// Runs the structure piece collectors scheduled for `step` and returns how
+    /// many of them ran (used only by development diagnostics).
     fn generate_structure_step<T: GenerationCache>(
         cache: &mut T,
         block_registry: &dyn WorldPortalExt,
         step: usize,
         population_seed: u64,
         world_seed: i64,
-    ) {
+    ) -> usize {
         let mut tasks = Vec::new();
         {
             let center_chunk = cache.get_center_chunk();
@@ -183,11 +202,13 @@ impl ProtoChunk {
         let decorator_seed = get_decorator_seed(population_seed, 0, step as u64);
         let mut random = RandomGenerator::Xoroshiro(Xoroshiro::from_seed(decorator_seed));
 
+        let collectors = tasks.len();
         let chunk = cache.get_center_chunk_mut();
         for collector_arc in tasks {
             let mut collector = collector_arc.lock().unwrap();
             collector.generate_in_chunk(chunk, block_registry, &mut random, world_seed);
         }
+        collectors
     }
 
     #[must_use]
@@ -232,10 +253,12 @@ impl ProtoChunk {
             ),
         );
 
+        let diagnose = diagnostics::enabled();
+
         for (i, set) in StructureSet::ALL.iter().enumerate() {
             let allowed_biomes = &generator.structure_allowed_biomes[&i];
 
-            if !should_generate_structure(
+            let verdict = should_generate_structure(
                 &set.placement,
                 calculator,
                 self.x,
@@ -243,7 +266,16 @@ impl ProtoChunk {
                 global_cache,
                 self,
                 allowed_biomes,
-            ) {
+            );
+            if !verdict.accepted() {
+                if diagnose && let Some(entry) = set.structures.first() {
+                    diagnostics::structure_placement_rejected(
+                        entry.structure,
+                        self.x,
+                        self.z,
+                        verdict,
+                    );
+                }
                 continue;
             }
 
@@ -291,6 +323,18 @@ impl ProtoChunk {
 
                 let failed_entry = candidates.remove(selected_idx);
                 total_weight -= failed_entry.weight;
+            }
+
+            if diagnose
+                && candidates.is_empty()
+                && let Some(entry) = set.structures.first()
+            {
+                diagnostics::structure_set_exhausted(
+                    entry.structure,
+                    set.structures.len(),
+                    self.x,
+                    self.z,
+                );
             }
         }
         self.stage = StagedChunkEnum::StructureStart;
@@ -375,6 +419,7 @@ impl ProtoChunk {
         // and out of the (cached) structure-start computation below.
         let chunk_min_y = self.bottom_y() as i32;
         let calculator = &generator.structure_calculator;
+        let diagnose = diagnostics::enabled();
 
         for (set_index, set) in StructureSet::ALL.iter().enumerate() {
             let set_allowed_biomes = &generator.structure_allowed_biomes[&set_index];
@@ -446,7 +491,9 @@ impl ProtoChunk {
                         global_cache,
                         self,
                         set_allowed_biomes,
-                    ) {
+                    )
+                    .accepted()
+                    {
                         continue;
                     }
                     for entry in set.structures {
@@ -486,11 +533,37 @@ impl ProtoChunk {
                             },
                         );
 
-                        if let Some(start_data) = start_data
-                            && start_data
-                                .get_bounding_box()
-                                .intersects_raw_xz(start_x, start_z, end_x, end_z)
+                        let Some(start_data) = start_data else {
+                            // The placement gate accepted this chunk, yet no start
+                            // came out of the generator: any piece vanilla would
+                            // have placed here is missing. This is the signature of
+                            // a truncated structure (broken mineshaft, half a
+                            // village), so it is worth a (sampled) line.
+                            if diagnose {
+                                diagnostics::structure_reference_missing_start(
+                                    entry.structure,
+                                    candidate_chunk_x,
+                                    candidate_chunk_z,
+                                    self.x,
+                                    self.z,
+                                );
+                            }
+                            continue;
+                        };
+
+                        if start_data
+                            .get_bounding_box()
+                            .intersects_raw_xz(start_x, start_z, end_x, end_z)
                         {
+                            if diagnose {
+                                diagnostics::structure_reference_attached(
+                                    entry.structure,
+                                    candidate_chunk_x,
+                                    candidate_chunk_z,
+                                    self.x,
+                                    self.z,
+                                );
+                            }
                             references.push((entry.structure, start_data.collector.clone()));
                             break;
                         }
