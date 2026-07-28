@@ -181,8 +181,10 @@ pub fn structure_reference_attached(
 }
 
 /// A candidate chunk passed the placement gate, yet recomputing its start
-/// yielded nothing. Pieces that vanilla would have placed here are missing —
-/// the signature of a truncated structure (broken mineshaft, half a village).
+/// yielded nothing.
+///
+/// Pieces that vanilla would have placed here are missing — the signature of a
+/// truncated structure (broken mineshaft, half a village).
 pub fn structure_reference_missing_start(
     key: StructureKeys,
     candidate_chunk_x: i32,
@@ -266,8 +268,10 @@ pub fn feature_step_slow(
 }
 
 /// The biome-zoom fuzz picked a quart outside this chunk and was clamped to the
-/// chunk edge, so the surface rule saw a different biome than vanilla would.
-/// This is the known source of chunk-border surface seams.
+/// chunk edge.
+///
+/// The surface rule therefore saw a different biome than vanilla would. This is
+/// the known source of chunk-border surface seams.
 pub fn biome_quart_clamped(
     chunk_x: i32,
     chunk_z: i32,
