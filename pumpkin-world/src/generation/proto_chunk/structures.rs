@@ -268,9 +268,9 @@ impl ProtoChunk {
                 allowed_biomes,
             );
             if !verdict.accepted() {
-                if diagnose && let Some(entry) = set.structures.first() {
+                if diagnose {
                     diagnostics::structure_placement_rejected(
-                        entry.structure,
+                        set.structures,
                         self.x,
                         self.z,
                         verdict,
@@ -325,16 +325,8 @@ impl ProtoChunk {
                 total_weight -= failed_entry.weight;
             }
 
-            if diagnose
-                && candidates.is_empty()
-                && let Some(entry) = set.structures.first()
-            {
-                diagnostics::structure_set_exhausted(
-                    entry.structure,
-                    set.structures.len(),
-                    self.x,
-                    self.z,
-                );
+            if diagnose && candidates.is_empty() {
+                diagnostics::structure_set_exhausted(set.structures, self.x, self.z);
             }
         }
         self.stage = StagedChunkEnum::StructureStart;

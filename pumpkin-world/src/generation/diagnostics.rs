@@ -14,7 +14,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pumpkin_data::structures::StructureKeys;
+use pumpkin_data::structures::{StructureKeys, WeightedEntry};
 use pumpkin_util::math::position::BlockPos;
 use tracing::{debug, info};
 
@@ -78,13 +78,32 @@ pub enum StructureReject {
     MissingBiomeTag,
 }
 
+/// Names every candidate of a structure set, so a set with several entries is
+/// not reported under whichever one happens to be first.
+fn describe_set(entries: &[WeightedEntry]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    for (i, entry) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        // Writing into a `String` cannot fail.
+        let _ = write!(out, "{:?}", entry.structure);
+    }
+    out
+}
+
 /// A structure set was skipped by the placement gate.
 ///
 /// Only frequency-reduction rejections are logged: `NotStartChunk` is the
 /// expected outcome for all but one chunk per `spacing²` region, so reporting it
 /// would drown out everything else.
+///
+/// The gate applies to the whole set, so all candidates are named rather than
+/// just the first entry.
 pub fn structure_placement_rejected(
-    key: StructureKeys,
+    entries: &[WeightedEntry],
     chunk_x: i32,
     chunk_z: i32,
     verdict: PlacementVerdict,
@@ -94,19 +113,21 @@ pub fn structure_placement_rejected(
     }
     if matches!(verdict, PlacementVerdict::FrequencyReduced) {
         debug!(
-            "worldgen/structure: {key:?} is the placement chunk for ({chunk_x}, {chunk_z}) but lost the frequency roll"
+            "worldgen/structure: set [{}] is the placement chunk for ({chunk_x}, {chunk_z}) but lost the frequency roll",
+            describe_set(entries)
         );
     }
 }
 
 /// Every weighted candidate of a structure set failed in this chunk.
-pub fn structure_set_exhausted(key: StructureKeys, entries: usize, chunk_x: i32, chunk_z: i32) {
+pub fn structure_set_exhausted(entries: &[WeightedEntry], chunk_x: i32, chunk_z: i32) {
     if !enabled() {
         return;
     }
     info!(
-        "worldgen/structure: set of {key:?} (+{} more) placed nothing in chunk ({chunk_x}, {chunk_z}): all {entries} candidates rejected",
-        entries.saturating_sub(1)
+        "worldgen/structure: set [{}] placed nothing in chunk ({chunk_x}, {chunk_z}): all {} candidates rejected",
+        describe_set(entries),
+        entries.len()
     );
 }
 
@@ -271,7 +292,8 @@ pub fn feature_step_slow(
 /// chunk edge.
 ///
 /// The surface rule therefore saw a different biome than vanilla would. This is
-/// the known source of chunk-border surface seams.
+/// a known source of chunk-border surface seams.
+#[inline]
 pub fn biome_quart_clamped(
     chunk_x: i32,
     chunk_z: i32,
