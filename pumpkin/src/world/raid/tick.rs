@@ -30,9 +30,8 @@ use crate::world::World;
 
 use super::state::{DEFAULT_PRE_RAID_TICKS, MAX_NO_ACTION_TIME, OUTSIDE_RAID_BOUNDS_TIMEOUT};
 use super::state::{
-    HERO_OF_THE_VILLAGE_DURATION, LOW_MOB_THRESHOLD, MAX_CELEBRATION_TICKS, NUM_SPAWN_ATTEMPTS,
-    POST_RAID_TICK_LIMIT, RAID_REMOVAL_THRESHOLD_SQR, RAID_TIMEOUT_TICKS,
-    SECTION_RADIUS_FOR_FINDING_NEW_VILLAGE_CENTER,
+    HERO_OF_THE_VILLAGE_DURATION, LOW_MOB_THRESHOLD, MAX_CELEBRATION_TICKS, POST_RAID_TICK_LIMIT,
+    RAID_REMOVAL_THRESHOLD_SQR, RAID_TIMEOUT_TICKS, SECTION_RADIUS_FOR_FINDING_NEW_VILLAGE_CENTER,
 };
 use super::{BarTitle, Raid, RaidInner, RaidStatus, village};
 
@@ -351,16 +350,15 @@ impl Raid {
                 set_title(inner, &mut plan, title);
             }
 
-            // Raid.java:319-336 — spawn as many groups as the state allows. The
-            // attempt/`stop` budget lives with the caller, which is the side that
-            // learns whether a spawn position could be found.
-            let mut waves = 0;
-            let mut probe = inner.state.clone();
-            while probe.should_spawn_group(raiders_alive) && waves <= NUM_SPAWN_ATTEMPTS {
-                probe.groups_spawned += 1;
-                waves += 1;
-            }
-            plan.waves_to_spawn = waves;
+            // Raid.java:319-336 — a successful `spawnGroup` immediately adds
+            // raiders to `groupRaiderMap`, making the next `shouldSpawnGroup`
+            // check false. Schedule one real spawn; the executor retries only
+            // when it cannot find a position.
+            plan.waves_to_spawn = if inner.state.should_spawn_group(raiders_alive) {
+                1
+            } else {
+                0
+            };
             plan.wave_spawn_pos = inner.wave_spawn_pos;
 
             // Raid.java:337-354 — post-raid grace, then victory.
@@ -463,8 +461,6 @@ pub async fn grant_heroes_of_the_village(world: &Arc<World>, heroes: &[Uuid], am
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::raid::state::RaidState;
-
     fn facts() -> WorldFacts {
         WorldFacts {
             center_chunk_loaded: true,
@@ -757,8 +753,10 @@ mod tests {
 
     #[test]
     fn state_clone_probe_does_not_mutate_the_raid() {
-        // `advance` probes wave spawning on a clone; the real counter must only
-        // move when the caller reports a successful spawn.
+        // A clone-based probe would advance every remaining wave without
+        // simulating the raiders added by `spawnGroup`. `advance` instead
+        // schedules one wave; `spawn_wave` owns successful-spawn bookkeeping
+        // (Raid.java:323-325, 487-488).
         let raid = raid();
         raid.with(|inner| inner.state.raid_cooldown_ticks = 0);
         let plan = raid.advance(&facts());
@@ -767,9 +765,18 @@ mod tests {
     }
 
     #[test]
-    fn raid_state_is_cloneable_for_the_probe() {
-        let state = RaidState::new(Difficulty::Hard);
-        let clone = state.clone();
-        assert_eq!(clone.num_groups, state.num_groups);
+    fn cooldown_expiry_schedules_only_one_wave() {
+        let raid = raid();
+        raid.with(|inner| {
+            inner.state.raid_cooldown_ticks = 0;
+            inner.state.raid_omen_level = 2;
+        });
+
+        let plan = raid.advance(&facts());
+
+        // A Normal raid has five regular waves and, at this omen level, a bonus
+        // wave. Vanilla still schedules only the first successful group here:
+        // spawnGroup adds its raiders before the loop checks again.
+        assert_eq!(plan.waves_to_spawn, 1);
     }
 }
