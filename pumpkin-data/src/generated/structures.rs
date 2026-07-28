@@ -1,8 +1,8 @@
 /* This file is generated. Do not edit manually. */
 use pumpkin_util::math::floor_div;
 use pumpkin_util::random::{
-    RandomGenerator, RandomImpl, get_carver_seed, get_region_seed, legacy_rand::LegacyRand,
-    xoroshiro128::Xoroshiro,
+    get_carver_seed, get_region_seed, legacy_rand::LegacyRand, xoroshiro128::Xoroshiro,
+    RandomGenerator, RandomImpl,
 };
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum StructureKeys {
@@ -141,7 +141,55 @@ pub struct Structure {
     pub dimension_padding: Option<i32>,
     pub use_expansion_hack: Option<bool>,
     pub pool_aliases: &'static [PoolAliasBinding],
+    #[doc = r" Per-category structure-specific natural-spawn pools."]
+    #[doc = r""]
+    #[doc = r" Vanilla 26.2 `ChunkGenerator.getMobsAt` (`ChunkGenerator.java:364-380`)"]
+    #[doc = r" falls back to biome spawns only when the category has no entry. A present"]
+    #[doc = r" entry with an empty `spawns` slice therefore suppresses that category."]
+    pub spawn_overrides: &'static [StructureSpawnOverride],
     pub structure_type: StructureType,
+}
+#[doc = r" A structure-specific natural-spawn pool for one mob category."]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StructureSpawnOverride {
+    pub category: StructureSpawnCategory,
+    pub bounding_box: StructureSpawnBoundingBox,
+    pub spawns: &'static [StructureSpawnEntry],
+}
+#[doc = r" The volume in which a structure spawn override applies."]
+#[doc = r""]
+#[doc = r" Vanilla 26.2 `StructureSpawnOverride.java:23-27` serializes whole"]
+#[doc = r" structure-start bounds as `full` and individual piece bounds as `piece`."]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StructureSpawnBoundingBox {
+    Full,
+    Piece,
+}
+#[doc = r" A mob category in a structure `spawn_overrides` map."]
+#[doc = r""]
+#[doc = r" This remains local to structure data so the `structures` feature does not"]
+#[doc = r" require the entity registry. Runtime spawning can map it to `MobCategory`."]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StructureSpawnCategory {
+    Monster,
+    Creature,
+    Ambient,
+    Axolotls,
+    UndergroundWaterCreature,
+    WaterCreature,
+    WaterAmbient,
+    Misc,
+}
+#[doc = r" One weighted entity entry in a structure spawn override."]
+#[doc = r""]
+#[doc = r" The namespaced type is intentionally retained as data, matching biome"]
+#[doc = r" spawner entries and allowing later runtime resolution through the entity registry."]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StructureSpawnEntry {
+    pub r#type: &'static str,
+    pub min_count: i32,
+    pub max_count: i32,
+    pub weight: i32,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum PoolAliasBinding {
@@ -211,6 +259,48 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: Some(false),
         pool_aliases: &[],
+        spawn_overrides: &[
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Monster,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Creature,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Ambient,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Axolotls,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::UndergroundWaterCreature,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::WaterCreature,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::WaterAmbient,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Misc,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[],
+            },
+        ],
         structure_type: StructureType::Jigsaw,
     };
     pub const BASTION_REMNANT: Self = Structure {
@@ -227,6 +317,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: Some(false),
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Jigsaw,
     };
     pub const BURIED_TREASURE: Self = Structure {
@@ -243,6 +334,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::BuriedTreasure,
     };
     pub const DESERT_PYRAMID: Self = Structure {
@@ -259,6 +351,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::DesertPyramid,
     };
     pub const END_CITY: Self = Structure {
@@ -275,6 +368,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::EndCity,
     };
     pub const FORTRESS: Self = Structure {
@@ -291,6 +385,42 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[StructureSpawnOverride {
+            category: StructureSpawnCategory::Monster,
+            bounding_box: StructureSpawnBoundingBox::Piece,
+            spawns: &[
+                StructureSpawnEntry {
+                    r#type: "minecraft:blaze",
+                    min_count: 2i32,
+                    max_count: 3i32,
+                    weight: 10i32,
+                },
+                StructureSpawnEntry {
+                    r#type: "minecraft:zombified_piglin",
+                    min_count: 4i32,
+                    max_count: 4i32,
+                    weight: 5i32,
+                },
+                StructureSpawnEntry {
+                    r#type: "minecraft:wither_skeleton",
+                    min_count: 5i32,
+                    max_count: 5i32,
+                    weight: 8i32,
+                },
+                StructureSpawnEntry {
+                    r#type: "minecraft:skeleton",
+                    min_count: 5i32,
+                    max_count: 5i32,
+                    weight: 2i32,
+                },
+                StructureSpawnEntry {
+                    r#type: "minecraft:magma_cube",
+                    min_count: 4i32,
+                    max_count: 4i32,
+                    weight: 3i32,
+                },
+            ],
+        }],
         structure_type: StructureType::Fortress,
     };
     pub const IGLOO: Self = Structure {
@@ -307,6 +437,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Igloo,
     };
     pub const JUNGLE_PYRAMID: Self = Structure {
@@ -323,6 +454,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::JungleTemple,
     };
     pub const MANSION: Self = Structure {
@@ -339,6 +471,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::WoodlandMansion,
     };
     pub const MINESHAFT: Self = Structure {
@@ -355,6 +488,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Mineshaft,
     };
     pub const MINESHAFT_MESA: Self = Structure {
@@ -371,6 +505,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Mineshaft,
     };
     pub const MONUMENT: Self = Structure {
@@ -387,6 +522,28 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Monster,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[StructureSpawnEntry {
+                    r#type: "minecraft:guardian",
+                    min_count: 2i32,
+                    max_count: 4i32,
+                    weight: 1i32,
+                }],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Axolotls,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::UndergroundWaterCreature,
+                bounding_box: StructureSpawnBoundingBox::Full,
+                spawns: &[],
+            },
+        ],
         structure_type: StructureType::OceanMonument,
     };
     pub const NETHER_FOSSIL: Self = Structure {
@@ -403,6 +560,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::NetherFossil,
     };
     pub const OCEAN_RUIN_COLD: Self = Structure {
@@ -419,6 +577,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::OceanRuin,
     };
     pub const OCEAN_RUIN_WARM: Self = Structure {
@@ -435,6 +594,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::OceanRuin,
     };
     pub const PILLAGER_OUTPOST: Self = Structure {
@@ -451,6 +611,16 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: Some(true),
         pool_aliases: &[],
+        spawn_overrides: &[StructureSpawnOverride {
+            category: StructureSpawnCategory::Monster,
+            bounding_box: StructureSpawnBoundingBox::Full,
+            spawns: &[StructureSpawnEntry {
+                r#type: "minecraft:pillager",
+                min_count: 1i32,
+                max_count: 1i32,
+                weight: 1i32,
+            }],
+        }],
         structure_type: StructureType::Jigsaw,
     };
     pub const RUINED_PORTAL: Self = Structure {
@@ -467,6 +637,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::RuinedPortal,
     };
     pub const RUINED_PORTAL_DESERT: Self = Structure {
@@ -483,6 +654,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::RuinedPortal,
     };
     pub const RUINED_PORTAL_JUNGLE: Self = Structure {
@@ -499,6 +671,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::RuinedPortal,
     };
     pub const RUINED_PORTAL_MOUNTAIN: Self = Structure {
@@ -515,6 +688,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::RuinedPortal,
     };
     pub const RUINED_PORTAL_NETHER: Self = Structure {
@@ -531,6 +705,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::RuinedPortal,
     };
     pub const RUINED_PORTAL_OCEAN: Self = Structure {
@@ -547,6 +722,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::RuinedPortal,
     };
     pub const RUINED_PORTAL_SWAMP: Self = Structure {
@@ -563,6 +739,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::RuinedPortal,
     };
     pub const SHIPWRECK: Self = Structure {
@@ -579,6 +756,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Shipwreck,
     };
     pub const SHIPWRECK_BEACHED: Self = Structure {
@@ -595,6 +773,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Shipwreck,
     };
     pub const STRONGHOLD: Self = Structure {
@@ -611,6 +790,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Stronghold,
     };
     pub const SWAMP_HUT: Self = Structure {
@@ -627,6 +807,28 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: None,
         pool_aliases: &[],
+        spawn_overrides: &[
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Monster,
+                bounding_box: StructureSpawnBoundingBox::Piece,
+                spawns: &[StructureSpawnEntry {
+                    r#type: "minecraft:witch",
+                    min_count: 1i32,
+                    max_count: 1i32,
+                    weight: 1i32,
+                }],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Creature,
+                bounding_box: StructureSpawnBoundingBox::Piece,
+                spawns: &[StructureSpawnEntry {
+                    r#type: "minecraft:cat",
+                    min_count: 1i32,
+                    max_count: 1i32,
+                    weight: 1i32,
+                }],
+            },
+        ],
         structure_type: StructureType::SwampHut,
     };
     pub const TRAIL_RUINS: Self = Structure {
@@ -643,6 +845,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: Some(false),
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Jigsaw,
     };
     pub const TRIAL_CHAMBERS: Self = Structure {
@@ -695,7 +898,8 @@ impl Structure {
                             },
                             PoolAliasBinding::Direct {
                                 alias: "minecraft:trial_chambers/spawner/contents/slow_ranged",
-                                target: "minecraft:trial_chambers/spawner/slow_ranged/poison_skeleton",
+                                target:
+                                    "minecraft:trial_chambers/spawner/slow_ranged/poison_skeleton",
                             },
                         ],
                         weight: 1u32,
@@ -741,6 +945,48 @@ impl Structure {
                 ],
             },
         ],
+        spawn_overrides: &[
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Monster,
+                bounding_box: StructureSpawnBoundingBox::Piece,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Creature,
+                bounding_box: StructureSpawnBoundingBox::Piece,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Ambient,
+                bounding_box: StructureSpawnBoundingBox::Piece,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Axolotls,
+                bounding_box: StructureSpawnBoundingBox::Piece,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::UndergroundWaterCreature,
+                bounding_box: StructureSpawnBoundingBox::Piece,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::WaterCreature,
+                bounding_box: StructureSpawnBoundingBox::Piece,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::WaterAmbient,
+                bounding_box: StructureSpawnBoundingBox::Piece,
+                spawns: &[],
+            },
+            StructureSpawnOverride {
+                category: StructureSpawnCategory::Misc,
+                bounding_box: StructureSpawnBoundingBox::Piece,
+                spawns: &[],
+            },
+        ],
         structure_type: StructureType::Jigsaw,
     };
     pub const VILLAGE_DESERT: Self = Structure {
@@ -757,6 +1003,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: Some(true),
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Jigsaw,
     };
     pub const VILLAGE_PLAINS: Self = Structure {
@@ -773,6 +1020,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: Some(true),
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Jigsaw,
     };
     pub const VILLAGE_SAVANNA: Self = Structure {
@@ -789,6 +1037,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: Some(true),
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Jigsaw,
     };
     pub const VILLAGE_SNOWY: Self = Structure {
@@ -805,6 +1054,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: Some(true),
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Jigsaw,
     };
     pub const VILLAGE_TAIGA: Self = Structure {
@@ -821,6 +1071,7 @@ impl Structure {
         dimension_padding: None,
         use_expansion_hack: Some(true),
         pool_aliases: &[],
+        spawn_overrides: &[],
         structure_type: StructureType::Jigsaw,
     };
     #[must_use]
