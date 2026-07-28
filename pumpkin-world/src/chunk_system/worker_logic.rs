@@ -247,7 +247,7 @@ pub fn run_generation(
         Ok(cache) => {
             let n = GEN_STAGE_DONE.fetch_add(1, AtomicOrdering::Relaxed) + 1;
             if pumpkin_config::development_mode() {
-                if elapsed_ms > 80 {
+                if elapsed_ms > crate::generation::diagnostics::SLOW_STAGE_MS {
                     info!(
                         "Terrain gen slow: chunk {:?} stage {:?} took {}ms (#{})",
                         pos, stage, elapsed_ms, n
