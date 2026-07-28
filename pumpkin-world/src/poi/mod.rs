@@ -61,19 +61,16 @@ pub struct PoiEntry {
     pub z: i32,
     #[serde(rename = "type")]
     pub poi_type: String,
+    /// Vanilla `PoiRecord.Packed.CODEC` defaults a missing `free_tickets` field
+    /// to zero when decoding (`PoiRecord.java:99-103`).
+    #[serde(default)]
     pub free_tickets: i32,
 }
 
 impl PoiEntry {
     #[must_use]
     pub fn new_portal(pos: BlockPos) -> Self {
-        Self {
-            x: pos.0.x,
-            y: pos.0.y,
-            z: pos.0.z,
-            poi_type: POI_TYPE_NETHER_PORTAL.to_string(),
-            free_tickets: 0,
-        }
+        Self::new(pos, POI_TYPE_NETHER_PORTAL)
     }
 
     /// Vanilla `PoiRecord(BlockPos, Holder<PoiType>, Runnable)`
@@ -226,10 +223,10 @@ impl PoiRegion {
     pub fn release(&mut self, pos: &BlockPos) -> Option<bool> {
         let entry = self.entries.get_mut(&Self::pos_key(pos))?;
         let released = entry.release_ticket();
-        if released {
-            self.dirty_chunks.insert((pos.0.x >> 4, pos.0.z >> 4));
-            self.dirty = true;
-        }
+        // `PoiSection.release` marks its section dirty even when the record was
+        // already full and `PoiRecord.releaseTicket` returned false.
+        self.dirty_chunks.insert((pos.0.x >> 4, pos.0.z >> 4));
+        self.dirty = true;
         Some(released)
     }
 
@@ -545,69 +542,349 @@ impl PoiStorage {
         })
     }
 
-    pub fn add(&mut self, pos: BlockPos, poi_type: &str) {
+    /// Adds a POI record, returning whether it was newly registered.
+    ///
+    /// A same-type record already at `pos` is left unchanged, including its
+    /// tickets, just as vanilla `PoiSection.add` does (`PoiSection.java:85-99`).
+    pub fn add(&mut self, pos: BlockPos, poi_type: &str) -> bool {
         let (rx, rz) = Self::region_coords(&pos);
-        let region = self.get_or_load_region(rx, rz);
-        region.add(PoiEntry {
-            x: pos.0.x,
-            y: pos.0.y,
-            z: pos.0.z,
-            poi_type: poi_type.to_string(),
-            free_tickets: 0,
-        });
+        self.get_or_load_region(rx, rz)
+            .add(PoiEntry::new(pos, poi_type))
     }
 
-    pub fn add_portal(&mut self, pos: BlockPos) {
-        self.add(pos, POI_TYPE_NETHER_PORTAL);
+    /// Adds a nether-portal POI.
+    pub fn add_portal(&mut self, pos: BlockPos) -> bool {
+        self.add(pos, POI_TYPE_NETHER_PORTAL)
     }
 
+    /// Removes the POI record at `pos`, if any.
     pub fn remove(&mut self, pos: &BlockPos) -> bool {
         let (rx, rz) = Self::region_coords(pos);
-        let region = self.get_or_load_region(rx, rz);
-        region.remove(pos)
+        self.get_or_load_region(rx, rz).remove(pos)
     }
 
-    /// Get all POI positions within a square radius (for portal search)
-    #[expect(clippy::similar_names)]
+    /// Returns the record at `pos`, loading its region if needed.
+    #[must_use]
+    pub fn get(&mut self, pos: &BlockPos) -> Option<&PoiEntry> {
+        let (rx, rz) = Self::region_coords(pos);
+        self.get_or_load_region(rx, rz).get(pos)
+    }
+
+    /// Returns the registered POI type at `pos`, loading its region if needed.
+    #[must_use]
+    pub fn get_type(&mut self, pos: &BlockPos) -> Option<&str> {
+        self.get(pos).map(|entry| entry.poi_type.as_str())
+    }
+
+    /// Tests the POI at `pos` against a type predicate.
+    ///
+    /// This is the storage counterpart of vanilla `PoiManager.exists`
+    /// (`PoiManager.java:150-152`). A persisted type Pumpkin does not know is
+    /// not a registered `PoiType`, so it cannot satisfy the predicate.
+    pub fn exists(
+        &mut self,
+        pos: &BlockPos,
+        mut type_predicate: impl FnMut(&PoiType) -> bool,
+    ) -> bool {
+        self.get(pos)
+            .and_then(|entry| types::by_name(&entry.poi_type))
+            .is_some_and(|poi_type| type_predicate(poi_type))
+    }
+
+    /// Tests whether `pos` contains the given registered POI type.
+    ///
+    /// This mirrors vanilla `PoiManager.existsAtPosition`
+    /// (`PoiManager.java:84-86`).
+    pub fn exists_at_position(&mut self, poi_type: &str, pos: &BlockPos) -> bool {
+        self.exists(pos, |registered_type| registered_type.name == poi_type)
+    }
+
+    /// Attempts to acquire a ticket for the POI at `pos`.
+    ///
+    /// Returns `false` for absent records and records without free tickets.
+    /// Vanilla's matching record mutation is `PoiRecord.acquireTicket`
+    /// (`PoiRecord.java:51-58`).
+    pub fn acquire(&mut self, pos: &BlockPos) -> bool {
+        let (rx, rz) = Self::region_coords(pos);
+        self.get_or_load_region(rx, rz).acquire(pos)
+    }
+
+    /// Attempts to release a ticket for the POI at `pos`.
+    ///
+    /// Returns `None` when no record is registered. Vanilla throws in that case
+    /// (`PoiManager.release`, `PoiManager.java:146-148`); the optional result
+    /// keeps this storage API safe for future world callers.
+    pub fn release(&mut self, pos: &BlockPos) -> Option<bool> {
+        let (rx, rz) = Self::region_coords(pos);
+        self.get_or_load_region(rx, rz).release(pos)
+    }
+
+    /// Returns POI records in the inclusive X/Z square around `center` for a
+    /// caller-supplied type predicate and vanilla occupancy predicate.
+    ///
+    /// This mirrors the final filter in vanilla `PoiManager.getInSquare`
+    /// (`PoiManager.java:88-94`): Y is intentionally unrestricted. Results use
+    /// a deterministic type/position order because this region-file storage uses
+    /// hash maps, whereas vanilla does not expose a stable order within a POI
+    /// section.
+    #[must_use]
+    pub fn get_entries_in_square_by(
+        &mut self,
+        center: BlockPos,
+        radius: i32,
+        mut type_predicate: impl FnMut(&PoiType) -> bool,
+        occupancy: Occupancy,
+    ) -> Vec<PoiEntry> {
+        self.query_entries_in_square(
+            center,
+            radius,
+            |entry| types::by_name(&entry.poi_type).is_some_and(&mut type_predicate),
+            occupancy,
+        )
+    }
+
+    /// Returns POI records in the inclusive three-dimensional Euclidean range
+    /// around `center` for a caller-supplied type predicate and vanilla
+    /// occupancy predicate.
+    ///
+    /// This follows vanilla `PoiManager.getInRange` (`PoiManager.java:96-99`),
+    /// including its `distanceSquared <= radiusSquared` boundary.
+    #[must_use]
+    pub fn get_entries_in_range_by(
+        &mut self,
+        center: BlockPos,
+        radius: i32,
+        type_predicate: impl FnMut(&PoiType) -> bool,
+        occupancy: Occupancy,
+    ) -> Vec<PoiEntry> {
+        if radius < 0 {
+            return Vec::new();
+        }
+        let radius_squared = i64::from(radius) * i64::from(radius);
+        let mut results = self.get_entries_in_square_by(center, radius, type_predicate, occupancy);
+        results.retain(|entry| Self::squared_distance(entry.pos(), center) <= radius_squared);
+        results
+    }
+
+    /// Returns POI records in the inclusive X/Z square around `center` for an
+    /// exact stored type name and vanilla occupancy predicate.
+    ///
+    /// Unlike `get_entries_in_square_by`, this also returns persisted unknown
+    /// types when `poi_type` is `None`, matching the raw stored-record behavior.
+    #[must_use]
+    pub fn get_entries_in_square(
+        &mut self,
+        center: BlockPos,
+        radius: i32,
+        poi_type: Option<&str>,
+        occupancy: Occupancy,
+    ) -> Vec<PoiEntry> {
+        self.query_entries_in_square(
+            center,
+            radius,
+            |entry| poi_type.is_none_or(|type_name| entry.poi_type == type_name),
+            occupancy,
+        )
+    }
+
+    /// Returns POI records in the inclusive three-dimensional Euclidean range
+    /// around `center` for an exact stored type name and vanilla occupancy
+    /// predicate.
+    #[must_use]
+    pub fn get_entries_in_range(
+        &mut self,
+        center: BlockPos,
+        radius: i32,
+        poi_type: Option<&str>,
+        occupancy: Occupancy,
+    ) -> Vec<PoiEntry> {
+        if radius < 0 {
+            return Vec::new();
+        }
+        let radius_squared = i64::from(radius) * i64::from(radius);
+        let mut results = self.get_entries_in_square(center, radius, poi_type, occupancy);
+        results.retain(|entry| Self::squared_distance(entry.pos(), center) <= radius_squared);
+        results
+    }
+
+    /// Returns POI positions in the inclusive X/Z square around `center`.
+    ///
+    /// This portal-compatible wrapper queries every occupancy state. General
+    /// callers that need ticket filtering should use `get_entries_in_square`.
+    #[must_use]
     pub fn get_in_square(
         &mut self,
         center: BlockPos,
         radius: i32,
         poi_type: Option<&str>,
     ) -> Vec<BlockPos> {
-        let min_x = center.0.x - radius;
-        let max_x = center.0.x + radius;
-        let min_z = center.0.z - radius;
-        let max_z = center.0.z + radius;
+        self.get_entries_in_square(center, radius, poi_type, Occupancy::Any)
+            .into_iter()
+            .map(|entry| entry.pos())
+            .collect()
+    }
 
-        // Calculate which regions we need to check
-        let min_rx = (min_x >> 4) >> 5;
-        let max_rx = (max_x >> 4) >> 5;
-        let min_rz = (min_z >> 4) >> 5;
-        let max_rz = (max_z >> 4) >> 5;
+    /// Returns POI positions in the inclusive X/Z square around `center` using
+    /// the supplied vanilla occupancy predicate.
+    #[must_use]
+    pub fn get_in_square_with_occupancy(
+        &mut self,
+        center: BlockPos,
+        radius: i32,
+        poi_type: Option<&str>,
+        occupancy: Occupancy,
+    ) -> Vec<BlockPos> {
+        self.get_entries_in_square(center, radius, poi_type, occupancy)
+            .into_iter()
+            .map(|entry| entry.pos())
+            .collect()
+    }
+
+    /// Returns POI positions in the inclusive three-dimensional Euclidean range
+    /// around `center`.
+    ///
+    /// This portal-compatible wrapper queries every occupancy state. General
+    /// callers that need ticket filtering should use `get_entries_in_range`.
+    #[must_use]
+    pub fn get_in_range(
+        &mut self,
+        center: BlockPos,
+        radius: i32,
+        poi_type: Option<&str>,
+    ) -> Vec<BlockPos> {
+        self.get_entries_in_range(center, radius, poi_type, Occupancy::Any)
+            .into_iter()
+            .map(|entry| entry.pos())
+            .collect()
+    }
+
+    /// Returns POI positions in the inclusive three-dimensional Euclidean range
+    /// around `center` using the supplied vanilla occupancy predicate.
+    #[must_use]
+    pub fn get_in_range_with_occupancy(
+        &mut self,
+        center: BlockPos,
+        radius: i32,
+        poi_type: Option<&str>,
+        occupancy: Occupancy,
+    ) -> Vec<BlockPos> {
+        self.get_entries_in_range(center, radius, poi_type, occupancy)
+            .into_iter()
+            .map(|entry| entry.pos())
+            .collect()
+    }
+
+    /// Finds and claims one matching POI in a single mutable-storage operation.
+    ///
+    /// The type and position predicates are evaluated before the ticket is
+    /// acquired. Holding `&mut self` across selection and mutation means callers
+    /// sharing this storage behind one lock cannot observe the same free ticket.
+    /// Candidate selection uses this storage's deterministic type/position order;
+    /// vanilla exposes only the first record produced by its section streams.
+    /// This is the atomic storage equivalent of vanilla `PoiManager.take`
+    /// (`PoiManager.java:134-139`).
+    pub fn take_by(
+        &mut self,
+        center: BlockPos,
+        radius: i32,
+        mut type_predicate: impl FnMut(&PoiType) -> bool,
+        mut filter: impl FnMut(&PoiType, BlockPos) -> bool,
+    ) -> Option<BlockPos> {
+        let mut entries = self.get_entries_in_range_by(
+            center,
+            radius,
+            |poi_type| type_predicate(poi_type),
+            Occupancy::HasSpace,
+        );
+        entries.sort_unstable_by(Self::compare_entries);
+
+        for entry in entries {
+            let Some(poi_type) = types::by_name(&entry.poi_type) else {
+                continue;
+            };
+            let pos = entry.pos();
+            if filter(poi_type, pos) && self.acquire(&pos) {
+                return Some(pos);
+            }
+        }
+        None
+    }
+
+    fn query_entries_in_square(
+        &mut self,
+        center: BlockPos,
+        radius: i32,
+        mut type_predicate: impl FnMut(&PoiEntry) -> bool,
+        occupancy: Occupancy,
+    ) -> Vec<PoiEntry> {
+        let Some((min_x, max_x, min_z, max_z)) = Self::square_bounds(center, radius) else {
+            return Vec::new();
+        };
+        let (min_rx, min_rz) = Self::region_coords(&BlockPos::new(min_x, center.0.y, min_z));
+        let (max_rx, max_rz) = Self::region_coords(&BlockPos::new(max_x, center.0.y, max_z));
 
         let mut results = Vec::new();
-
         for rx in min_rx..=max_rx {
             for rz in min_rz..=max_rz {
                 let region = self.get_or_load_region(rx, rz);
-                for entry in region.get_all() {
-                    if let Some(filter_type) = poi_type
-                        && entry.poi_type != filter_type
-                    {
-                        continue;
-                    }
-
-                    let dx = (entry.x - center.0.x).abs();
-                    let dz = (entry.z - center.0.z).abs();
-                    if dx <= radius && dz <= radius {
-                        results.push(entry.pos());
-                    }
-                }
+                results.extend(
+                    region
+                        .get_all()
+                        .into_iter()
+                        .filter(|entry| {
+                            Self::matches_square(entry, center, radius)
+                                && type_predicate(entry)
+                                && occupancy.test(entry)
+                        })
+                        .cloned(),
+                );
             }
         }
-
+        Self::sort_entries(&mut results);
         results
+    }
+
+    const fn square_bounds(center: BlockPos, radius: i32) -> Option<(i32, i32, i32, i32)> {
+        if radius < 0 {
+            return None;
+        }
+        let Some(min_x) = center.0.x.checked_sub(radius) else {
+            return None;
+        };
+        let Some(max_x) = center.0.x.checked_add(radius) else {
+            return None;
+        };
+        let Some(min_z) = center.0.z.checked_sub(radius) else {
+            return None;
+        };
+        let Some(max_z) = center.0.z.checked_add(radius) else {
+            return None;
+        };
+        Some((min_x, max_x, min_z, max_z))
+    }
+
+    fn matches_square(entry: &PoiEntry, center: BlockPos, radius: i32) -> bool {
+        (i64::from(entry.x) - i64::from(center.0.x)).abs() <= i64::from(radius)
+            && (i64::from(entry.z) - i64::from(center.0.z)).abs() <= i64::from(radius)
+    }
+
+    fn squared_distance(pos: BlockPos, center: BlockPos) -> i64 {
+        let x = i64::from(pos.0.x) - i64::from(center.0.x);
+        let y = i64::from(pos.0.y) - i64::from(center.0.y);
+        let z = i64::from(pos.0.z) - i64::from(center.0.z);
+        x * x + y * y + z * z
+    }
+
+    fn sort_entries(entries: &mut [PoiEntry]) {
+        entries.sort_unstable_by(Self::compare_entries);
+    }
+
+    fn compare_entries(left: &PoiEntry, right: &PoiEntry) -> std::cmp::Ordering {
+        left.poi_type
+            .cmp(&right.poi_type)
+            .then_with(|| left.x.cmp(&right.x))
+            .then_with(|| left.y.cmp(&right.y))
+            .then_with(|| left.z.cmp(&right.z))
     }
 
     pub fn save_all(&mut self) -> std::io::Result<()> {
@@ -645,61 +922,309 @@ impl PoiStorage {
 mod tests {
     use super::*;
 
+    fn pos(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos::new(x, y, z)
+    }
+
+    fn test_storage() -> (tempfile::TempDir, PoiStorage) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = PoiStorage::new(temp_dir.path().join("poi"));
+        (temp_dir, storage)
+    }
+
     #[test]
     fn poi_entry() {
-        let entry = PoiEntry::new_portal(BlockPos(Vector3::new(100, 64, 200)));
+        let entry = PoiEntry::new_portal(pos(100, 64, 200));
         assert_eq!(entry.x, 100);
         assert_eq!(entry.y, 64);
         assert_eq!(entry.z, 200);
         assert_eq!(entry.poi_type, POI_TYPE_NETHER_PORTAL);
+        assert_eq!(entry.free_tickets, 0);
+    }
+
+    #[test]
+    fn known_poi_types_start_with_their_vanilla_ticket_capacity() {
+        let home = PoiEntry::new(pos(100, 64, 200), "minecraft:home");
+        assert_eq!(home.free_tickets, 1);
+        assert!(home.has_space());
+        assert!(!home.is_occupied());
+
+        let meeting = PoiEntry::new(pos(100, 64, 201), "minecraft:meeting");
+        assert_eq!(meeting.free_tickets, 32);
+        assert!(meeting.has_space());
+        assert!(!meeting.is_occupied());
+    }
+
+    #[test]
+    fn take_and_release_manage_home_ticket() {
+        let home = pos(0, 64, 0);
+        let (_temp_dir, mut storage) = test_storage();
+        assert!(storage.add(home, "minecraft:home"));
+
+        assert_eq!(
+            storage.take_by(
+                home,
+                0,
+                |poi_type| poi_type.name == "minecraft:home",
+                |_, _| true,
+            ),
+            Some(home)
+        );
+        assert_eq!(storage.get(&home).map(|entry| entry.free_tickets), Some(0));
+        assert_eq!(
+            storage.take_by(
+                home,
+                0,
+                |poi_type| poi_type.name == "minecraft:home",
+                |_, _| true,
+            ),
+            None
+        );
+        assert_eq!(storage.release(&home), Some(true));
+        assert_eq!(storage.get(&home).map(|entry| entry.free_tickets), Some(1));
+        assert_eq!(storage.release(&home), Some(false));
+        assert_eq!(storage.release(&pos(8, 64, 8)), None);
+    }
+
+    #[test]
+    fn get_and_get_type_load_records_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = pos(0, 64, 0);
+
+        let mut writer = PoiStorage::new(dir.path().join("poi"));
+        assert!(writer.add(home, "minecraft:home"));
+        writer.save_all().unwrap();
+
+        let mut reader = PoiStorage::new(dir.path().join("poi"));
+        assert_eq!(reader.get_type(&home), Some("minecraft:home"));
+        assert_eq!(reader.get(&home).map(|entry| entry.free_tickets), Some(1));
+    }
+
+    #[test]
+    fn duplicate_add_preserves_claimed_ticket() {
+        let home = pos(0, 64, 0);
+        let (_temp_dir, mut storage) = test_storage();
+        assert!(storage.add(home, "minecraft:home"));
+        assert!(storage.acquire(&home));
+        assert!(!storage.add(home, "minecraft:home"));
+        assert_eq!(storage.get(&home).map(|entry| entry.free_tickets), Some(0));
+    }
+
+    #[test]
+    fn different_type_add_replaces_the_record() {
+        let poi_pos = pos(0, 64, 0);
+        let (_temp_dir, mut storage) = test_storage();
+        assert!(storage.add(poi_pos, "minecraft:home"));
+        assert!(storage.acquire(&poi_pos));
+
+        assert!(storage.add(poi_pos, "minecraft:meeting"));
+        assert_eq!(storage.get_type(&poi_pos), Some("minecraft:meeting"));
+        assert_eq!(
+            storage.get(&poi_pos).map(|entry| entry.free_tickets),
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn missing_ticket_field_defaults_to_zero_when_deserialized() {
+        let entry: PoiEntry =
+            serde_json::from_str(r#"{"x":0,"y":64,"z":0,"type":"minecraft:home"}"#).unwrap();
+        assert_eq!(entry.free_tickets, 0);
+        assert!(entry.is_occupied());
+    }
+
+    #[test]
+    fn occupancy_filters_match_ticket_semantics() {
+        let home = pos(0, 64, 0);
+        let portal = pos(1, 64, 0);
+        let (_temp_dir, mut storage) = test_storage();
+        assert!(storage.add(home, "minecraft:home"));
+        assert!(storage.add_portal(portal));
+
+        assert_eq!(
+            storage.get_in_square_with_occupancy(home, 2, None, Occupancy::Any),
+            vec![home, portal]
+        );
+        assert_eq!(
+            storage.get_in_square_with_occupancy(home, 2, None, Occupancy::HasSpace),
+            vec![home]
+        );
+        assert_eq!(
+            storage.get_in_square_with_occupancy(home, 2, None, Occupancy::IsOccupied),
+            vec![portal]
+        );
+
+        assert!(storage.acquire(&home));
+        assert!(
+            storage
+                .get_in_square_with_occupancy(home, 2, None, Occupancy::HasSpace)
+                .is_empty()
+        );
+        assert_eq!(
+            storage.get_in_square_with_occupancy(home, 2, None, Occupancy::IsOccupied),
+            vec![home, portal]
+        );
+    }
+
+    #[test]
+    #[expect(clippy::similar_names)]
+    fn square_and_range_queries_use_vanilla_boundaries() {
+        let center = pos(0, 64, 0);
+        let square_edge = pos(2, -128, 2);
+        let circle_edge = pos(3, 64, 4);
+        let outside_range_y = pos(0, 70, 0);
+        let outside_square = pos(3, 64, 0);
+        let (_temp_dir, mut storage) = test_storage();
+        for entry in [square_edge, circle_edge, outside_range_y, outside_square] {
+            assert!(storage.add(entry, "minecraft:home"));
+        }
+
+        let square =
+            storage.get_in_square_with_occupancy(center, 2, Some("minecraft:home"), Occupancy::Any);
+        assert_eq!(square, vec![outside_range_y, square_edge]);
+        assert_eq!(
+            storage.get_in_range(center, 5, Some("minecraft:home")),
+            vec![circle_edge]
+        );
+    }
+
+    #[test]
+    fn type_predicate_queries_and_exists_use_registered_metadata() {
+        let center = pos(0, 64, 0);
+        let home = pos(0, 64, 0);
+        let farmer = pos(1, 64, 0);
+        let meeting = pos(2, 64, 0);
+        let (_temp_dir, mut storage) = test_storage();
+        assert!(storage.add(home, "minecraft:home"));
+        assert!(storage.add(farmer, "minecraft:farmer"));
+        assert!(storage.add(meeting, "minecraft:meeting"));
+
+        assert!(storage.exists_at_position("minecraft:home", &home));
+        assert!(storage.exists(&farmer, |poi_type| poi_type.acquirable_job_site));
+        assert!(!storage.exists(&home, |poi_type| poi_type.acquirable_job_site));
+
+        assert_eq!(
+            storage
+                .get_entries_in_square_by(center, 2, |poi_type| poi_type.village, Occupancy::Any)
+                .into_iter()
+                .map(|entry| entry.pos())
+                .collect::<Vec<_>>(),
+            vec![farmer, home, meeting]
+        );
+        assert_eq!(
+            storage
+                .get_entries_in_range_by(
+                    center,
+                    2,
+                    |poi_type| poi_type.acquirable_job_site,
+                    Occupancy::Any,
+                )
+                .into_iter()
+                .map(|entry| entry.pos())
+                .collect::<Vec<_>>(),
+            vec![farmer]
+        );
+    }
+
+    #[test]
+    fn take_by_applies_type_and_position_predicates_before_claiming() {
+        let center = pos(0, 64, 0);
+        let farmer = pos(1, 64, 0);
+        let armorer = pos(2, 64, 0);
+        let unavailable = pos(3, 64, 0);
+        let (_temp_dir, mut storage) = test_storage();
+        assert!(storage.add(farmer, "minecraft:farmer"));
+        assert!(storage.add(armorer, "minecraft:armorer"));
+        assert!(storage.add(unavailable, "minecraft:butcher"));
+        assert!(storage.acquire(&unavailable));
+
+        assert_eq!(
+            storage.take_by(
+                center,
+                3,
+                |poi_type| poi_type.acquirable_job_site,
+                |poi_type, poi_pos| poi_type.name == "minecraft:farmer" && poi_pos == farmer,
+            ),
+            Some(farmer)
+        );
+        assert_eq!(
+            storage.get(&farmer).map(|entry| entry.free_tickets),
+            Some(0)
+        );
+        assert_eq!(
+            storage.get(&armorer).map(|entry| entry.free_tickets),
+            Some(1)
+        );
+        assert_eq!(
+            storage.get(&unavailable).map(|entry| entry.free_tickets),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn take_by_selects_across_region_boundaries() {
+        let center = pos(511, 64, 0);
+        let first = pos(510, 64, 0);
+        let second = pos(513, 64, 0);
+        let (_temp_dir, mut storage) = test_storage();
+        assert!(storage.add(first, "minecraft:farmer"));
+        assert!(storage.add(second, "minecraft:farmer"));
+
+        assert_eq!(
+            storage.take_by(
+                center,
+                3,
+                |poi_type| poi_type.acquirable_job_site,
+                |_, _| true,
+            ),
+            Some(first)
+        );
+        assert_eq!(
+            storage.take_by(
+                center,
+                3,
+                |poi_type| poi_type.acquirable_job_site,
+                |_, _| true,
+            ),
+            Some(second)
+        );
     }
 
     #[test]
     fn poi_region() {
         let mut region = PoiRegion::new();
-        region.add(PoiEntry::new_portal(BlockPos(Vector3::new(100, 64, 200))));
-        region.add(PoiEntry::new_portal(BlockPos(Vector3::new(101, 64, 200))));
+        region.add(PoiEntry::new_portal(pos(100, 64, 200)));
+        region.add(PoiEntry::new_portal(pos(101, 64, 200)));
 
         assert_eq!(region.get_all().len(), 2);
         assert!(region.is_dirty());
 
-        region.remove(&BlockPos(Vector3::new(100, 64, 200)));
+        region.remove(&pos(100, 64, 200));
         assert_eq!(region.get_all().len(), 1);
     }
 
     #[test]
     fn poi_storage_mca() {
-        let dir = std::env::temp_dir().join("pumpkin_poi_mca_test");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let poi_dir = dir.path().join("poi");
+        let mut storage = PoiStorage::new(poi_dir.clone());
 
-        let mut storage = PoiStorage::new(dir.join("poi"));
+        storage.add_portal(pos(100, 64, 100));
+        storage.add_portal(pos(110, 64, 100));
+        storage.add_portal(pos(1000, 64, 1000)); // Different region
 
-        storage.add_portal(BlockPos(Vector3::new(100, 64, 100)));
-        storage.add_portal(BlockPos(Vector3::new(110, 64, 100)));
-        storage.add_portal(BlockPos(Vector3::new(1000, 64, 1000))); // Different region
-
-        let results = storage.get_in_square(
-            BlockPos(Vector3::new(105, 64, 100)),
-            16,
-            Some(POI_TYPE_NETHER_PORTAL),
-        );
+        let results = storage.get_in_square(pos(105, 64, 100), 16, Some(POI_TYPE_NETHER_PORTAL));
         assert_eq!(results.len(), 2);
 
         storage.save_all().unwrap();
 
         // Verify .mca file was created
-        let mca_path = dir.join("poi").join("r.0.0.mca");
+        let mca_path = poi_dir.join("r.0.0.mca");
         assert!(mca_path.exists());
 
         // Reload and verify
-        let mut storage2 = PoiStorage::new(dir.join("poi"));
-        let results2 = storage2.get_in_square(
-            BlockPos(Vector3::new(105, 64, 100)),
-            16,
-            Some(POI_TYPE_NETHER_PORTAL),
-        );
+        let mut storage2 = PoiStorage::new(poi_dir);
+        let results2 = storage2.get_in_square(pos(105, 64, 100), 16, Some(POI_TYPE_NETHER_PORTAL));
         assert_eq!(results2.len(), 2);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
