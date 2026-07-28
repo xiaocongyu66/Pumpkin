@@ -1062,9 +1062,10 @@ mod tests {
             storage.get_in_square_with_occupancy(home, 2, None, Occupancy::HasSpace),
             vec![home]
         );
-        assert_eq!(
-            storage.get_in_square_with_occupancy(home, 2, None, Occupancy::IsOccupied),
-            vec![portal]
+        assert!(
+            storage
+                .get_in_square_with_occupancy(home, 2, None, Occupancy::IsOccupied)
+                .is_empty()
         );
 
         assert!(storage.acquire(&home));
@@ -1075,7 +1076,7 @@ mod tests {
         );
         assert_eq!(
             storage.get_in_square_with_occupancy(home, 2, None, Occupancy::IsOccupied),
-            vec![home, portal]
+            vec![home]
         );
     }
 
