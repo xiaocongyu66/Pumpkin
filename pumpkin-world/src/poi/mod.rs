@@ -783,6 +783,7 @@ impl PoiStorage {
     /// vanilla exposes only the first record produced by its section streams.
     /// This is the atomic storage equivalent of vanilla `PoiManager.take`
     /// (`PoiManager.java:134-139`).
+    #[must_use]
     pub fn take_by(
         &mut self,
         center: BlockPos,
@@ -790,19 +791,31 @@ impl PoiStorage {
         mut type_predicate: impl FnMut(&PoiType) -> bool,
         mut filter: impl FnMut(&PoiType, BlockPos) -> bool,
     ) -> Option<BlockPos> {
-        let mut entries = self.get_entries_in_range_by(
-            center,
-            radius,
-            |poi_type| type_predicate(poi_type),
-            Occupancy::HasSpace,
-        );
-        entries.sort_unstable_by(Self::compare_entries);
+        let Some((min_x, max_x, min_z, max_z)) = Self::square_bounds(center, radius) else {
+            return None;
+        };
+        let radius_squared = i64::from(radius) * i64::from(radius);
+        let (min_rx, min_rz) = Self::region_coords(&BlockPos::new(min_x, center.0.y, min_z));
+        let (max_rx, max_rz) = Self::region_coords(&BlockPos::new(max_x, center.0.y, max_z));
 
-        for entry in entries {
-            let Some(poi_type) = types::by_name(&entry.poi_type) else {
-                continue;
-            };
-            let pos = entry.pos();
+        let mut candidates = Vec::new();
+        for rx in min_rx..=max_rx {
+            for rz in min_rz..=max_rz {
+                let region = self.get_or_load_region(rx, rz);
+                candidates.extend(region.get_all().into_iter().filter_map(|entry| {
+                    let poi_type = types::by_name(&entry.poi_type)?;
+                    (Self::matches_square(entry, center, radius)
+                        && Self::squared_distance(entry.pos(), center) <= radius_squared
+                        && type_predicate(poi_type)
+                        && Occupancy::HasSpace.test(entry))
+                    .then_some((entry.pos(), poi_type))
+                }));
+            }
+        }
+        candidates
+            .sort_unstable_by_key(|(pos, poi_type)| (poi_type.name, pos.0.x, pos.0.y, pos.0.z));
+
+        for (pos, poi_type) in candidates {
             if filter(poi_type, pos) && self.acquire(&pos) {
                 return Some(pos);
             }
