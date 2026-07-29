@@ -11,6 +11,7 @@ use pumpkin_util::random::{
 
 use crate::biome::{BiomeSupplier, MultiNoiseBiomeSupplier, end::TheEndBiomeSupplier};
 use crate::chunk_system::StagedChunkEnum;
+use crate::generation::diagnostics;
 use crate::generation::structure::lazily_generate_structure;
 use crate::generation::structure::placement::should_generate_structure;
 use crate::generation::structure::structures::{
@@ -30,14 +31,18 @@ use super::{ActiveSupplier, GenerationCache, ProtoChunk};
 
 /// Selects a structure-set entry using Vanilla's `ChunkGenerator.createStructures`
 /// weighted fallback order (`/root/Vanilla/src/net/minecraft/world/level/chunk/
-/// ChunkGenerator.java:405-427`).
+/// ChunkGenerator.java:401-427`).
 ///
 /// Multi-entry sets use `WorldgenRandom(new LegacyRandomSource(0))` seeded by
 /// `setLargeFeatureSeed(seed, chunk_x, chunk_z)`
-/// (`/root/Vanilla/src/net/minecraft/world/level/levelgen/WorldgenRandom.java:69-75`),
-/// which is the same Legacy RNG returned by `create_chunk_random`. Failed
-/// candidates are removed and the next bounded draw uses the remaining total
-/// weight. Single-entry sets bypass this selection RNG entirely, as Vanilla does.
+/// (`ChunkGenerator.java:407-408`,
+/// `/root/Vanilla/src/net/minecraft/world/level/levelgen/WorldgenRandom.java:69-75`),
+/// which is the same Legacy RNG returned by `create_chunk_random`. That single
+/// instance is reused for every retry: each failed candidate costs exactly one
+/// `nextInt(total)` draw, is removed, and its weight is subtracted so the next
+/// draw is bounded by the shrunk total (`ChunkGenerator.java:415`, `:425-426`).
+/// Single-entry sets bypass this selection RNG entirely, as Vanilla does
+/// (`ChunkGenerator.java:401-404`).
 fn try_select_structure_set_entry<'a, T>(
     entries: &'a [WeightedEntry],
     seed: i64,
@@ -57,10 +62,34 @@ fn try_select_structure_set_entry<'a, T>(
                     .expect("structure-set total weight fits in u32")
             });
 
+            // `while (!options.isEmpty())` (`ChunkGenerator.java:413-427`). The RNG
+            // advance on the retry path is the subtle part, so it is mirrored
+            // literally:
+            // * `ChunkGenerator.java:415` draws `random.nextInt(total)` once per
+            //   loop iteration, i.e. exactly one bounded draw per candidate
+            //   attempt - a failed candidate consumes one draw, no more, no less.
+            // * The draw uses the *same* `WorldgenRandom` built once before the
+            //   loop (`ChunkGenerator.java:407-408`); vanilla never re-seeds or
+            //   forks it between attempts, so the failure path must not call
+            //   `create_chunk_random` again.
+            // * `ChunkGenerator.java:425-426` removes the failed candidate and
+            //   subtracts its weight, so the next draw is bounded by the shrunk
+            //   total. Bound changes are what make the sequence diverge from a
+            //   naive "reroll with the original total" implementation.
+            // Note `next_bounded_i32` itself may consume more than one LCG step
+            // for non-power-of-two bounds; that rejection loop is identical in
+            // `BitRandomSource.nextInt` and `LegacyRand::next_bounded_i32`.
             while !candidates.is_empty() {
                 let mut choice = random.next_bounded_i32(
                     i32::try_from(total_weight).expect("structure-set total weight fits in i32"),
                 );
+                // `ChunkGenerator.java:416-421`: walk the remaining candidates in
+                // order, subtracting each weight, and take the first one that
+                // drives the running choice negative. The scan reads no RNG, so
+                // the fallback below cannot change the draw count: `choice` is
+                // always `< total_weight`, hence some candidate always drives it
+                // negative and `selected_index = 0` is unreachable (vanilla's
+                // equivalent `options.get(index)` would throw there).
                 let mut selected_index = 0;
 
                 for (index, entry) in candidates.iter().enumerate() {
@@ -73,10 +102,14 @@ fn try_select_structure_set_entry<'a, T>(
                 }
 
                 let selected = candidates[selected_index];
+                // `ChunkGenerator.java:422-424`: the first candidate that places
+                // wins and the remaining candidates are never offered.
                 if let Some(result) = try_entry(selected) {
                     return Some((selected, result));
                 }
 
+                // `ChunkGenerator.java:425-426`, in that order: drop the failed
+                // candidate, then shrink the total by its weight.
                 total_weight -= candidates.remove(selected_index).weight;
             }
 
@@ -115,8 +148,14 @@ impl ProtoChunk {
         let population_seed =
             Xoroshiro::get_population_seed(random_config.seed, start_block_x, start_block_z);
 
+        let diagnose = diagnostics::enabled();
+
         for step in 0..11 {
-            Self::generate_structure_step(
+            // `Instant::now` is only taken in development mode; the release path
+            // keeps the plain call.
+            let step_started = diagnose.then(std::time::Instant::now);
+
+            let collectors = Self::generate_structure_step(
                 cache,
                 block_registry,
                 step,
@@ -155,18 +194,30 @@ impl ProtoChunk {
                     );
                 }
             }
+
+            if let Some(started) = step_started {
+                diagnostics::feature_step_slow(
+                    center_x,
+                    center_z,
+                    step,
+                    collectors,
+                    started.elapsed().as_millis(),
+                );
+            }
         }
 
         cache.get_center_chunk_mut().stage = StagedChunkEnum::Features;
     }
 
+    /// Runs the structure piece collectors scheduled for `step` and returns how
+    /// many of them ran (used only by development diagnostics).
     fn generate_structure_step<T: GenerationCache>(
         cache: &mut T,
         block_registry: &dyn WorldPortalExt,
         step: usize,
         population_seed: u64,
         world_seed: i64,
-    ) {
+    ) -> usize {
         let mut tasks = Vec::new();
         {
             let center_chunk = cache.get_center_chunk();
@@ -240,11 +291,13 @@ impl ProtoChunk {
         let decorator_seed = get_decorator_seed(population_seed, 0, step as u64);
         let mut random = RandomGenerator::Xoroshiro(Xoroshiro::from_seed(decorator_seed));
 
+        let collectors = tasks.len();
         let chunk = cache.get_center_chunk_mut();
         for collector_arc in tasks {
             let mut collector = collector_arc.lock().unwrap();
             collector.generate_in_chunk(chunk, block_registry, &mut random, world_seed);
         }
+        collectors
     }
 
     #[must_use]
@@ -288,10 +341,12 @@ impl ProtoChunk {
             ),
         );
 
+        let diagnose = diagnostics::enabled();
+
         for (i, set) in StructureSet::ALL.iter().enumerate() {
             let allowed_biomes = &generator.structure_allowed_biomes[&i];
 
-            if !should_generate_structure(
+            let verdict = should_generate_structure(
                 &set.placement,
                 calculator,
                 self.x,
@@ -299,11 +354,20 @@ impl ProtoChunk {
                 global_cache,
                 self,
                 allowed_biomes,
-            ) {
+            );
+            if !verdict.accepted() {
+                if diagnose {
+                    diagnostics::structure_placement_rejected(
+                        set.structures,
+                        self.x,
+                        self.z,
+                        verdict,
+                    );
+                }
                 continue;
             }
 
-            if let Some((entry, position)) = try_select_structure_set_entry(
+            let selected = try_select_structure_set_entry(
                 set.structures,
                 seed as i64,
                 self.x,
@@ -316,9 +380,16 @@ impl ProtoChunk {
                         &mut height_sampler,
                     )
                 },
-            ) {
+            );
+
+            if let Some((entry, position)) = selected {
                 self.structure_starts
                     .insert(entry.structure, StructureInstance::Start(position));
+            } else if diagnose && !set.structures.is_empty() {
+                // The helper only returns `None` once every weighted candidate has
+                // been offered and rejected, which is what the old
+                // `candidates.is_empty()` check stood for.
+                diagnostics::structure_set_exhausted(set.structures, self.x, self.z);
             }
         }
         self.stage = StagedChunkEnum::StructureStart;
@@ -393,6 +464,7 @@ impl ProtoChunk {
         let mut references = Vec::new();
         let chunk_min_y = self.bottom_y() as i32;
         let calculator = &generator.structure_calculator;
+        let diagnose = diagnostics::enabled();
 
         for (set_index, set) in StructureSet::ALL.iter().enumerate() {
             let set_allowed_biomes = &generator.structure_allowed_biomes[&set_index];
@@ -464,7 +536,9 @@ impl ProtoChunk {
                         global_cache,
                         self,
                         set_allowed_biomes,
-                    ) {
+                    )
+                    .accepted()
+                    {
                         continue;
                     }
                     if let Some((entry, start_data)) = try_select_structure_set_entry(
@@ -479,7 +553,7 @@ impl ProtoChunk {
                             // world seed, so cache it: otherwise every surrounding chunk whose
                             // references overlap it would re-run the (expensive) jigsaw
                             // expansion. `context` is only built on a cache miss.
-                            global_cache.get_or_compute_structure_start(
+                            let start_data = global_cache.get_or_compute_structure_start(
                                 entry.structure,
                                 candidate_chunk_x,
                                 candidate_chunk_z,
@@ -507,12 +581,38 @@ impl ProtoChunk {
                                         &mut multi_noise_sampler,
                                     )
                                 },
-                            )
+                            );
+
+                            if start_data.is_none() && diagnose {
+                                // The placement gate accepted this chunk, yet no start
+                                // came out of the generator: any piece vanilla would
+                                // have placed here is missing. This is the signature of
+                                // a truncated structure (broken mineshaft, half a
+                                // village), so it is worth a (sampled) line.
+                                diagnostics::structure_reference_missing_start(
+                                    entry.structure,
+                                    candidate_chunk_x,
+                                    candidate_chunk_z,
+                                    self.x,
+                                    self.z,
+                                );
+                            }
+
+                            start_data
                         },
                     ) && start_data
                         .get_bounding_box()
                         .intersects_raw_xz(start_x, start_z, end_x, end_z)
                     {
+                        if diagnose {
+                            diagnostics::structure_reference_attached(
+                                entry.structure,
+                                candidate_chunk_x,
+                                candidate_chunk_z,
+                                self.x,
+                                self.z,
+                            );
+                        }
                         references.push((entry.structure, start_data.collector.clone()));
                     }
                 }
@@ -531,7 +631,7 @@ impl ProtoChunk {
 
 #[cfg(test)]
 mod tests {
-    use pumpkin_data::structures::{StructureKeys, StructureSet};
+    use pumpkin_data::structures::{StructureKeys, StructureSet, WeightedEntry};
 
     use super::try_select_structure_set_entry;
 
@@ -583,5 +683,197 @@ mod tests {
         // with the start chunk coordinates, so they cannot drift to static entry order.
         assert_eq!(choose(), Some(StructureKeys::BastionRemnant));
         assert_eq!(choose(), Some(StructureKeys::BastionRemnant));
+    }
+
+    /// Records the exact order in which candidates are offered, so a change in
+    /// RNG behaviour (extra/missing draw, wrong seeding, wrong index scan) shows
+    /// up as a sequence mismatch instead of a silent world-gen drift.
+    fn offer_order(
+        entries: &'static [WeightedEntry],
+        seed: i64,
+        chunk_x: i32,
+        chunk_z: i32,
+        accept: impl Fn(StructureKeys) -> bool,
+    ) -> (Vec<StructureKeys>, Option<StructureKeys>) {
+        let mut offered = Vec::new();
+        let selected = try_select_structure_set_entry(entries, seed, chunk_x, chunk_z, |entry| {
+            offered.push(entry.structure);
+            accept(entry.structure).then_some(())
+        })
+        .map(|(entry, ())| entry.structure);
+
+        (offered, selected)
+    }
+
+    #[test]
+    fn seven_entry_set_exhausts_in_vanilla_order() {
+        // Oracle: vanilla `ChunkGenerator.createStructures` (ChunkGenerator.java:405-427)
+        // with `WorldgenRandom(new LegacyRandomSource(0))` +
+        // `setLargeFeatureSeed(123456789, 0, 0)` (WorldgenRandom.java:69-75) draws
+        // nextInt with the shrinking total weight: 1/7, 0/6, 3/5, 1/4, 0/3, 0/2, 0/1.
+        let (offered, selected) = offer_order(
+            StructureSet::RUINED_PORTALS.structures,
+            123_456_789,
+            0,
+            0,
+            |_| false,
+        );
+
+        assert_eq!(selected, None);
+        assert_eq!(
+            offered,
+            vec![
+                StructureKeys::RuinedPortalDesert,
+                StructureKeys::RuinedPortal,
+                StructureKeys::RuinedPortalOcean,
+                StructureKeys::RuinedPortalSwamp,
+                StructureKeys::RuinedPortalJungle,
+                StructureKeys::RuinedPortalMountain,
+                StructureKeys::RuinedPortalNether,
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_placements_walk_the_same_sequence_as_vanilla() {
+        // Same fixture as above, but the last candidate is the one that places:
+        // every earlier failure must consume exactly one draw and remove its weight.
+        let (offered, selected) = offer_order(
+            StructureSet::RUINED_PORTALS.structures,
+            123_456_789,
+            0,
+            0,
+            |key| key == StructureKeys::RuinedPortalNether,
+        );
+
+        assert_eq!(selected, Some(StructureKeys::RuinedPortalNether));
+        assert_eq!(offered.len(), 7);
+        assert_eq!(offered[0], StructureKeys::RuinedPortalDesert);
+        assert_eq!(offered[6], StructureKeys::RuinedPortalNether);
+    }
+
+    #[test]
+    fn weighted_retry_stops_at_the_first_success() {
+        // minecraft:villages, seed 987654321, chunk (5, -9): vanilla offers
+        // desert, plains, taiga (ChunkGenerator.java:413-427). Accepting taiga must
+        // stop there, leaving snowy/savanna untouched.
+        let (offered, selected) = offer_order(
+            StructureSet::VILLAGES.structures,
+            987_654_321,
+            5,
+            -9,
+            |key| key == StructureKeys::VillageTaiga,
+        );
+
+        assert_eq!(selected, Some(StructureKeys::VillageTaiga));
+        assert_eq!(
+            offered,
+            vec![
+                StructureKeys::VillageDesert,
+                StructureKeys::VillagePlains,
+                StructureKeys::VillageTaiga,
+            ]
+        );
+    }
+
+    #[test]
+    fn single_entry_set_offers_once_and_skips_the_selection_rng() {
+        // Vanilla short-circuits `structures.size() == 1` before constructing the
+        // WorldgenRandom (ChunkGenerator.java:401-404), so a single-entry set must
+        // consume zero selection draws: the entry is offered exactly once, and the
+        // outcome is identical for every seed / chunk coordinate.
+        for (seed, chunk_x, chunk_z) in [(123_456_789, 7, 7), (-42, -1_000, 999), (0, 0, 0)] {
+            let (offered, selected) = offer_order(
+                StructureSet::OCEAN_MONUMENTS.structures,
+                seed,
+                chunk_x,
+                chunk_z,
+                |_| true,
+            );
+            assert_eq!(offered, vec![StructureKeys::Monument]);
+            assert_eq!(selected, Some(StructureKeys::Monument));
+
+            let (offered, selected) = offer_order(
+                StructureSet::OCEAN_MONUMENTS.structures,
+                seed,
+                chunk_x,
+                chunk_z,
+                |_| false,
+            );
+            assert_eq!(offered, vec![StructureKeys::Monument]);
+            assert_eq!(selected, None);
+        }
+    }
+
+    /// The selection RNG is derived purely from (`world seed`, `chunk_x`,
+    /// `chunk_z`) (`ChunkGenerator.java:407-408`), so repeating a selection for
+    /// the same inputs must replay the identical candidate sequence: no hidden
+    /// global RNG state, no iteration-order dependence, no leakage from a
+    /// previous set's draws. A regression here would make a world non
+    /// reproducible across saves/restarts.
+    #[test]
+    fn selection_is_deterministic_for_a_fixed_seed_and_chunk() {
+        const SEED: i64 = -4_242_424_242;
+        const CHUNK_X: i32 = 391;
+        const CHUNK_Z: i32 = -1_207;
+
+        // Vanilla oracle for (SEED, CHUNK_X, CHUNK_Z): the full exhaustion order
+        // of every candidate, i.e. one bounded draw per failed candidate against
+        // the shrinking total (`ChunkGenerator.java:415`, `:425-426`).
+        let expected = [
+            (
+                StructureSet::MINESHAFTS.structures,
+                vec![StructureKeys::MineshaftMesa, StructureKeys::Mineshaft],
+            ),
+            (
+                StructureSet::NETHER_COMPLEXES.structures,
+                vec![StructureKeys::BastionRemnant, StructureKeys::Fortress],
+            ),
+            (
+                StructureSet::VILLAGES.structures,
+                vec![
+                    StructureKeys::VillageSavanna,
+                    StructureKeys::VillageSnowy,
+                    StructureKeys::VillageDesert,
+                    StructureKeys::VillageTaiga,
+                    StructureKeys::VillagePlains,
+                ],
+            ),
+            (
+                StructureSet::RUINED_PORTALS.structures,
+                vec![
+                    StructureKeys::RuinedPortal,
+                    StructureKeys::RuinedPortalJungle,
+                    StructureKeys::RuinedPortalMountain,
+                    StructureKeys::RuinedPortalNether,
+                    StructureKeys::RuinedPortalOcean,
+                    StructureKeys::RuinedPortalDesert,
+                    StructureKeys::RuinedPortalSwamp,
+                ],
+            ),
+        ];
+
+        for (entries, vanilla_order) in expected {
+            for _ in 0..4 {
+                // Every candidate fails: records the whole sequence, not just the
+                // winner, so an extra or missing draw cannot hide behind an early
+                // success.
+                let (offered, selected) = offer_order(entries, SEED, CHUNK_X, CHUNK_Z, |_| false);
+                assert_eq!(selected, None);
+                assert_eq!(offered, vanilla_order);
+
+                // Accepting only the last candidate walks the same sequence, and
+                // accepting everything must stop at its first element.
+                let last = *vanilla_order.last().expect("the set has candidates");
+                let (offered, selected) =
+                    offer_order(entries, SEED, CHUNK_X, CHUNK_Z, |key| key == last);
+                assert_eq!(selected, Some(last));
+                assert_eq!(offered, vanilla_order);
+
+                let (offered, selected) = offer_order(entries, SEED, CHUNK_X, CHUNK_Z, |_| true);
+                assert_eq!(selected, Some(vanilla_order[0]));
+                assert_eq!(offered, vec![vanilla_order[0]]);
+            }
+        }
     }
 }

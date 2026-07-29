@@ -271,6 +271,32 @@ impl Default for GlobalStructureCache {
     }
 }
 
+/// Outcome of the placement gate for one structure set in one chunk.
+///
+/// Vanilla's `StructurePlacement.isStructureChunk`
+/// (`StructurePlacement.java` l.77-83) only returns a boolean; the split exists
+/// so development-mode
+/// diagnostics can tell "this chunk is simply not the region's start chunk"
+/// (the expected outcome for all but one chunk per region) apart from "this
+/// chunk *is* the start chunk but lost the frequency roll".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacementVerdict {
+    /// The set may attempt to place a structure in this chunk.
+    Accepted,
+    /// Not the placement chunk of this region / not a stronghold ring position.
+    NotStartChunk,
+    /// Placement chunk, but the frequency reducer rejected it.
+    FrequencyReduced,
+}
+
+impl PlacementVerdict {
+    /// Whether the structure set may attempt placement.
+    #[must_use]
+    pub const fn accepted(self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+}
+
 #[must_use]
 // #[expect(clippy::too_many_arguments)]
 pub fn should_generate_structure(
@@ -281,8 +307,8 @@ pub fn should_generate_structure(
     global_cache: &GlobalStructureCache,
     biome_supplier: &ProtoChunk,
     allowed_biomes: &[u16],
-) -> bool {
-    is_start_chunk(
+) -> PlacementVerdict {
+    if !is_start_chunk(
         &placement.placement_type,
         calculator,
         chunk_x,
@@ -291,14 +317,22 @@ pub fn should_generate_structure(
         global_cache,
         biome_supplier,
         allowed_biomes,
-    ) && apply_frequency_reduction(
+    ) {
+        return PlacementVerdict::NotStartChunk;
+    }
+
+    if apply_frequency_reduction(
         placement.frequency_reduction_method,
         calculator.seed,
         chunk_x,
         chunk_z,
         placement.salt,
         placement.frequency.unwrap_or(1.0),
-    )
+    ) {
+        PlacementVerdict::Accepted
+    } else {
+        PlacementVerdict::FrequencyReduced
+    }
 }
 
 fn apply_frequency_reduction(

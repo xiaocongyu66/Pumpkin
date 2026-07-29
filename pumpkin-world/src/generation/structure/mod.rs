@@ -7,7 +7,7 @@ use crate::{
     ProtoChunk,
     biome::BiomeSupplier,
     generation::{
-        biome_coords,
+        biome_coords, diagnostics,
         noise::router::multi_noise_sampler::MultiNoiseSampler,
         structure::structures::{
             StructureGenerator, StructureGeneratorContext, StructurePosition,
@@ -138,40 +138,58 @@ pub fn try_generate_structure(
         }
     };
 
-    if let Some(pos) = structure_pos {
-        // Get the biome at the structure's starting position.
-        // Clamp biome Y to the chunk's physical range; structure start positions can
-        // lie outside the generation shape (for example, Nether fossils).
-        let biome_y = biome_coords::from_block(pos.start_pos.0.y);
-        let biome_height = (chunk.height() >> 2) as i32;
-        let biome_bottom = biome_coords::from_block(chunk.bottom_y() as i32);
-        let clamped_biome_y = biome_y.clamp(biome_bottom, biome_bottom + biome_height - 1);
+    let Some(pos) = structure_pos else {
+        diagnostics::structure_start_declined(
+            *key,
+            chunk.x,
+            chunk.z,
+            diagnostics::StructureReject::NoPosition,
+        );
+        return None;
+    };
 
-        let current_biome = chunk.get_biome_id(
-            biome_coords::from_block(pos.start_pos.0.x),
-            clamped_biome_y,
-            biome_coords::from_block(pos.start_pos.0.z),
-        ) as u16;
+    // Get the biome at the structure's starting position.
+    // Clamp biome Y to the chunk's physical range; structure start positions can
+    // lie outside the generation shape (for example, Nether fossils).
+    let biome_y = biome_coords::from_block(pos.start_pos.0.y);
+    let biome_height = (chunk.height() >> 2) as i32;
+    let biome_bottom = biome_coords::from_block(chunk.bottom_y() as i32);
+    let clamped_biome_y = biome_y.clamp(biome_bottom, biome_bottom + biome_height - 1);
 
-        let biomes = get_tag_ids(
-            RegistryKey::WorldgenBiome,
-            structure
-                .biomes
-                .strip_prefix('#')
-                .unwrap_or(structure.biomes),
-        )
-        .unwrap();
+    let current_biome = chunk.get_biome_id(
+        biome_coords::from_block(pos.start_pos.0.x),
+        clamped_biome_y,
+        biome_coords::from_block(pos.start_pos.0.z),
+    ) as u16;
 
-        // Check if the biome is allowed for this structure
-        if biomes.contains(&current_biome) {
-            return Some(pos);
-        }
+    let biomes = get_tag_ids(
+        RegistryKey::WorldgenBiome,
+        structure
+            .biomes
+            .strip_prefix('#')
+            .unwrap_or(structure.biomes),
+    )
+    .unwrap();
+
+    // Check if the biome is allowed for this structure
+    if biomes.contains(&current_biome) {
+        diagnostics::structure_start_accepted(*key, chunk.x, chunk.z, pos.start_pos);
+        return Some(pos);
     }
+    diagnostics::structure_start_declined(
+        *key,
+        chunk.x,
+        chunk.z,
+        diagnostics::StructureReject::Biome {
+            biome_id: current_biome,
+        },
+    );
 
     None
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn lazily_generate_structure(
     key: &StructureKeys,
     structure: &Structure,
@@ -179,6 +197,9 @@ pub fn lazily_generate_structure(
     biome_supplier: &dyn BiomeSupplier,
     multi_noise_sampler: &mut MultiNoiseSampler,
 ) -> Option<StructurePosition> {
+    // `context` is consumed by the dispatch below; keep the coordinates for the
+    // diagnostics at the end.
+    let (chunk_x, chunk_z) = (context.chunk_x, context.chunk_z);
     let structure_pos = match key {
         StructureKeys::BuriedTreasure => {
             BuriedTreasureGenerator::get_structure_position(&BuriedTreasureGenerator, context)
@@ -243,25 +264,53 @@ pub fn lazily_generate_structure(
         }
     };
 
-    if let Some(pos) = structure_pos {
-        // Get the biome mathematically, bypassing the chunk boundaries entirely!
-        let biome_x = biome_coords::from_block(pos.start_pos.0.x);
-        let biome_y = biome_coords::from_block(pos.start_pos.0.y);
-        let biome_z = biome_coords::from_block(pos.start_pos.0.z);
+    let Some(pos) = structure_pos else {
+        diagnostics::structure_lazy_declined(
+            *key,
+            chunk_x,
+            chunk_z,
+            diagnostics::StructureReject::NoPosition,
+        );
+        return None;
+    };
 
-        let biome = biome_supplier.biome(biome_x, biome_y, biome_z, multi_noise_sampler);
+    // Get the biome mathematically, bypassing the chunk boundaries entirely!
+    let biome_x = biome_coords::from_block(pos.start_pos.0.x);
+    let biome_y = biome_coords::from_block(pos.start_pos.0.y);
+    let biome_z = biome_coords::from_block(pos.start_pos.0.z);
 
-        if let Some(biomes) = get_tag_ids(
-            RegistryKey::WorldgenBiome,
-            structure
-                .biomes
-                .strip_prefix('#')
-                .unwrap_or(structure.biomes),
-        ) && biomes.contains(&(biome.id as u16))
-        {
-            return Some(pos);
-        }
+    let biome = biome_supplier.biome(biome_x, biome_y, biome_z, multi_noise_sampler);
+
+    let Some(biomes) = get_tag_ids(
+        RegistryKey::WorldgenBiome,
+        structure
+            .biomes
+            .strip_prefix('#')
+            .unwrap_or(structure.biomes),
+    ) else {
+        // Unlike the start path (which `unwrap()`s), an unresolvable biome tag
+        // silently rejects here — the structure can then never generate.
+        diagnostics::structure_lazy_declined(
+            *key,
+            chunk_x,
+            chunk_z,
+            diagnostics::StructureReject::MissingBiomeTag,
+        );
+        return None;
+    };
+
+    if biomes.contains(&(biome.id as u16)) {
+        diagnostics::structure_lazy_accepted(*key, chunk_x, chunk_z, pos.start_pos);
+        return Some(pos);
     }
 
+    diagnostics::structure_lazy_declined(
+        *key,
+        chunk_x,
+        chunk_z,
+        diagnostics::StructureReject::Biome {
+            biome_id: biome.id as u16,
+        },
+    );
     None
 }
