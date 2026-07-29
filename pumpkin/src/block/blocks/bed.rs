@@ -6,9 +6,12 @@ use pumpkin_data::BlockStateId;
 use pumpkin_data::block_properties::BedPart;
 use pumpkin_data::block_properties::BlockProperties;
 use pumpkin_data::dimension::Dimension;
-use pumpkin_data::entity::EntityType;
+use pumpkin_data::entity::{EntityPose, EntityType};
+use pumpkin_data::meta_data_type::MetaDataType;
+use pumpkin_data::tracked_data::TrackedData;
 use pumpkin_data::translation;
 use pumpkin_macros::pumpkin_block_from_tag;
+use pumpkin_protocol::java::client::play::Metadata;
 use pumpkin_util::GameMode;
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::text::TextComponent;
@@ -212,18 +215,7 @@ impl BlockBehaviour for BedBlock {
             let state_id = args.world.get_block_state_id(args.position);
             let bed_props = BedProperties::from_state_id(state_id, args.block);
 
-            let (bed_head_pos, bed_foot_pos) = if bed_props.part == BedPart::Head {
-                (
-                    *args.position,
-                    args.position
-                        .offset(bed_props.facing.opposite().to_offset()),
-                )
-            } else {
-                (
-                    args.position.offset(bed_props.facing.to_offset()),
-                    *args.position,
-                )
-            };
+            let (bed_head_pos, bed_foot_pos) = bed_halves(*args.position, bed_props);
 
             // Explode if not in the overworld
             if args.world.dimension != Dimension::OVERWORLD {
@@ -241,6 +233,31 @@ impl BlockBehaviour for BedBlock {
                 return BlockActionResult::SuccessServer;
             }
 
+            // Vanilla `BedBlock.useWithoutItem` (BedBlock.java:113-118) resolves the head half
+            // first (BedBlock.java:98) and handles `occupied` before any other sleep check:
+            // wake a sleeping villager, otherwise report the bed as occupied.
+            if bed_props.occupied {
+                if Self::kick_villager_out_of_bed(args.world, &bed_head_pos) {
+                    let (bed_block, bed_state_id) =
+                        args.world.get_block_and_state_id(&bed_head_pos);
+                    Self::set_occupied(false, args.world, bed_block, &bed_head_pos, bed_state_id)
+                        .await;
+                    return BlockActionResult::SuccessServer;
+                }
+
+                args.player
+                    .send_system_message_raw(
+                        &TextComponent::translate_cross(
+                            translation::java::BLOCK_MINECRAFT_BED_OCCUPIED,
+                            translation::bedrock::TILE_BED_OCCUPIED,
+                            [],
+                        ),
+                        true,
+                    )
+                    .await;
+                return BlockActionResult::SuccessServer;
+            }
+
             // Make sure the bed is not obstructed
             if args.world.get_block_state(&bed_head_pos.up()).is_solid()
                 || args.world.get_block_state(&bed_foot_pos.up()).is_solid()
@@ -250,23 +267,6 @@ impl BlockBehaviour for BedBlock {
                         &TextComponent::translate_cross(
                             translation::java::BLOCK_MINECRAFT_BED_OBSTRUCTED,
                             translation::java::BLOCK_MINECRAFT_BED_OBSTRUCTED,
-                            [],
-                        ),
-                        true,
-                    )
-                    .await;
-                return BlockActionResult::SuccessServer;
-            }
-
-            // Make sure the bed is not occupied
-            if bed_props.occupied {
-                // TODO: Wake up villager
-
-                args.player
-                    .send_system_message_raw(
-                        &TextComponent::translate_cross(
-                            translation::java::BLOCK_MINECRAFT_BED_OCCUPIED,
-                            translation::bedrock::TILE_BED_OCCUPIED,
                             [],
                         ),
                         true,
@@ -379,6 +379,50 @@ impl BlockBehaviour for BedBlock {
 }
 
 impl BedBlock {
+    /// Vanilla `BedBlock.kickVillagerOutOfBed` (`BedBlock.java:127-134`).
+    ///
+    /// Wakes at most one sleeper, like vanilla's `villagers.get(0).stopSleeping()`
+    /// (`BedBlock.java:132`), and reports whether one was found.
+    ///
+    /// Not covered here: vanilla's `Villager.stopSleeping` also records
+    /// `MemoryModuleType.LAST_WOKEN` (`Villager.java:835-838`), which blocks
+    /// `SleepInBed` for 100 ticks (`SleepInBed.java:30`, `SleepInBed.java:49`).
+    /// Pumpkin has no such memory, so a kicked villager may reclaim the bed on its
+    /// next sleep tick. That cooldown belongs on the villager entity, not here.
+    fn kick_villager_out_of_bed(world: &World, bed_head_pos: &BlockPos) -> bool {
+        let entities = world.entities.load();
+        let Some(villager) = entities.iter().find(|entity| {
+            let base = entity.get_entity();
+            is_sleeping_villager_in_bed(
+                base.entity_type,
+                base.pose.load(),
+                entity.get_home_pos(),
+                *bed_head_pos,
+            )
+        }) else {
+            return false;
+        };
+
+        let entity = villager.get_entity();
+        entity.set_pose(EntityPose::Standing);
+        entity.send_meta_data(
+            &[
+                Metadata::new(
+                    TrackedData::SLEEPING_POSITION,
+                    MetaDataType::OPTIONAL_BLOCK_POS,
+                    None::<BlockPos>,
+                ),
+                Metadata::new(
+                    TrackedData::SLEEPING_POS_ID,
+                    MetaDataType::OPTIONAL_BLOCK_POS,
+                    None::<BlockPos>,
+                ),
+            ],
+            None,
+        );
+        true
+    }
+
     pub async fn set_occupied(
         occupied: bool,
         world: &Arc<World>,
@@ -416,6 +460,42 @@ impl BedBlock {
     }
 }
 
+/// Resolves the `(head, foot)` positions of a bed from either of its halves.
+///
+/// Vanilla normalises to the head half in `BedBlock.useWithoutItem`
+/// (`BedBlock.java:98`) before touching `OCCUPIED` or looking for a sleeper, so
+/// interacting with the foot must behave exactly like interacting with the head.
+fn bed_halves(clicked_pos: BlockPos, props: BedProperties) -> (BlockPos, BlockPos) {
+    if props.part == BedPart::Head {
+        (
+            clicked_pos,
+            clicked_pos.offset(props.facing.opposite().to_offset()),
+        )
+    } else {
+        (clicked_pos.offset(props.facing.to_offset()), clicked_pos)
+    }
+}
+
+/// Identifies the current Pumpkin equivalent of Vanilla's sleeping villager at a bed.
+///
+/// Vanilla selects with `AABB(headPos)` + `LivingEntity::isSleeping`
+/// (`BedBlock.java:128`), which works there because `startSleeping` teleports the
+/// sleeper into the bed block (`LivingEntity.java:3539`, `setPosToBed` at
+/// `LivingEntity.java:3545-3547`). Pumpkin's villagers keep standing next to the
+/// bed while asleep (`entity/passive/villager/job.rs:261-269` sets only the pose and
+/// the sleeping-position metadata), so a volume search would miss them; the claimed
+/// bed head in `home_pos` is the reliable key instead.
+fn is_sleeping_villager_in_bed(
+    entity_type: &EntityType,
+    pose: EntityPose,
+    home_pos: Option<BlockPos>,
+    bed_head_pos: BlockPos,
+) -> bool {
+    entity_type == &EntityType::VILLAGER
+        && pose == EntityPose::Sleeping
+        && home_pos == Some(bed_head_pos)
+}
+
 async fn can_sleep(world: &Arc<World>) -> bool {
     let time = world.level_time.lock().await;
     let weather = world.weather.lock().await;
@@ -431,4 +511,71 @@ async fn can_sleep(world: &Arc<World>) -> bool {
 
 fn entity_prevents_sleep(entity: &Entity) -> bool {
     NO_SLEEP_IDS.contains(&entity.entity_type.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_data::block_properties::HorizontalFacing;
+
+    const BED_HEAD: BlockPos = BlockPos::new(12, 64, -4);
+    const OTHER_BED_HEAD: BlockPos = BlockPos::new(13, 64, -4);
+
+    #[test]
+    fn both_bed_halves_resolve_to_the_same_pair() {
+        // A north-facing bed: the head sits one block north of the foot.
+        let foot_pos = BlockPos::new(12, 64, -4);
+        let head_pos = BlockPos::new(12, 64, -5);
+
+        let foot_props = BedProperties {
+            facing: HorizontalFacing::North,
+            occupied: true,
+            part: BedPart::Foot,
+        };
+        let head_props = BedProperties {
+            part: BedPart::Head,
+            ..foot_props
+        };
+
+        assert_eq!(bed_halves(foot_pos, foot_props), (head_pos, foot_pos));
+        assert_eq!(bed_halves(head_pos, head_props), (head_pos, foot_pos));
+    }
+
+    #[test]
+    fn sleeping_villager_in_matching_bed_is_selected() {
+        assert!(is_sleeping_villager_in_bed(
+            &EntityType::VILLAGER,
+            EntityPose::Sleeping,
+            Some(BED_HEAD),
+            BED_HEAD,
+        ));
+    }
+
+    #[test]
+    fn wakeup_selection_excludes_other_entity_states_and_beds() {
+        assert!(!is_sleeping_villager_in_bed(
+            &EntityType::VILLAGER,
+            EntityPose::Standing,
+            Some(BED_HEAD),
+            BED_HEAD,
+        ));
+        assert!(!is_sleeping_villager_in_bed(
+            &EntityType::ZOMBIE_VILLAGER,
+            EntityPose::Sleeping,
+            Some(BED_HEAD),
+            BED_HEAD,
+        ));
+        assert!(!is_sleeping_villager_in_bed(
+            &EntityType::VILLAGER,
+            EntityPose::Sleeping,
+            Some(OTHER_BED_HEAD),
+            BED_HEAD,
+        ));
+        assert!(!is_sleeping_villager_in_bed(
+            &EntityType::VILLAGER,
+            EntityPose::Sleeping,
+            None,
+            BED_HEAD,
+        ));
+    }
 }
