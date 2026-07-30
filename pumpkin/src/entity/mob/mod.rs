@@ -392,9 +392,11 @@ pub trait Mob: EntityBase + Send + Sync {
 #[expect(dead_code)]
 const DEFAULT_PATHFINDING_FAVOR: f32 = 0.0;
 
-/// 抹掉这只 mob 的全部 AI 状态，对齐原版 `Mob.removeFreeWill()`
-/// （`Mob.java:1424-1427`：`removeAllGoals(goal -> true)` + `brain.removeAllBehaviors()`）。
-/// Pumpkin 没有 brain，两个 `GoalSelector` 加 `MobEntity.target` 就是全部 AI 状态。
+/// 抹掉这只 mob 的全部 AI 状态。
+///
+/// 对齐原版 `Mob.removeFreeWill()`（`Mob.java:1424-1427`：`removeAllGoals(goal -> true)`
+/// 加 `brain.removeAllBehaviors()`）。Pumpkin 没有 brain，两个 `GoalSelector` 加
+/// `MobEntity.target` 就是全部 AI 状态。
 ///
 /// 这一步在 Rust 下是内存回收的必需动作：15 个 goal 字段（`ai/goal/revenge.rs` 的
 /// `target`、`ai/goal/follow_owner.rs` 的 `owner`、`ai/goal/breed.rs` 的 `mate` 等）和
