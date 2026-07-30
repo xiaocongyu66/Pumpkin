@@ -251,7 +251,9 @@ impl World {
         // 内存普查：按固定 tick 间隔输出各长生命周期容器的 len()，
         // 用来验证「只涨不落」是否还在发生。能观测比猜着修可靠。
         if pumpkin_config::development_mode()
-            && MEMORY_CENSUS_TICKS.fetch_add(1, Relaxed) % MEMORY_CENSUS_INTERVAL_TICKS == 0
+            && MEMORY_CENSUS_TICKS
+                .fetch_add(1, Relaxed)
+                .is_multiple_of(MEMORY_CENSUS_INTERVAL_TICKS)
         {
             self.log_memory_census();
         }
