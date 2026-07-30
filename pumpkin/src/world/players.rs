@@ -257,6 +257,16 @@ impl World {
 
         player.living_entity.reset_state().await;
 
+        // 死亡时 `LivingEntity::tick` 在 death_time==20 那一刻打上
+        // `RemovalReason::Killed`（living.rs:3117-3131）。原版 `PlayerList.respawn`
+        // 是 new 一个 `ServerPlayer` 沿用旧 id，新实体的 `removalReason` 天然是
+        // null；我们复用同一个 `Arc<Player>`，所以必须显式清掉这个标记（等价于
+        // 原版 `Entity.unsetRemoved`，Entity.java:3764），否则
+        // `LivingEntity::is_alive()` 里的 `!entity.is_removed()` 会永久为假，
+        // 复活后的玩家在所有 AI 眼里都是尸体（铁傀儡的 RevengeGoal 不反击等）。
+        // 放在 `reset_state` 之后：先恢复满血与 death_time，再宣告「在世」。
+        player.living_entity.entity.unset_removed();
+
         player.send_permission_lvl_update();
 
         player.hunger_manager.restart();
