@@ -53,7 +53,10 @@ impl ThrownItemEntity {
     pub fn new(entity: Entity, owner: &Entity, gravity: f64) -> Self {
         let mut owner_pos = owner.pos.load();
         owner_pos.y += owner.get_eye_height() - 0.1;
-        entity.pos.store(owner_pos);
+        // 走 `set_pos` 而不是直接写 `pos`：`set_pos` 会同步刷新 `block_pos` /
+        // `chunk_pos` / `bounding_box`，对齐原版 `ThrowableProjectile` 构造里的
+        // `this.setPos(x, y, z)`（`Vanilla/.../projectile/ThrowableProjectile.java:28`）。
+        entity.set_pos(owner_pos);
         Self {
             entity,
             owner_id: Some(owner.entity_id),

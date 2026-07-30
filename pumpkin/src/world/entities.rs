@@ -318,8 +318,16 @@ impl World {
         let chunks_set: FxHashSet<_> = chunks.iter().copied().collect();
         let entities_to_remove = self.entities.drain_if(|entity| {
             let base_entity = entity.get_entity();
-            let pos = base_entity.chunk_pos.load();
-            if chunks_set.contains(&pos) {
+            // 按 `chunk_pos` 匹配。这是唯一会把实体从 `EntityLookup` 批量摘掉的
+            // 地方，依赖「`chunk_pos` 永远和实时 `pos` 一致」这条不变量——该不变量
+            // 由 `Entity::set_pos` 维护，所有位置写入都必须走它（对齐原版
+            // `Entity.setPosRaw`，见 `entity/projectile/*`、`entity/vehicle/minecart.rs`）。
+            // 一旦有人绕过 `set_pos` 直接写 `pos`，那个实体的缓存值就会永久失效，
+            // 它真正所在的区块卸载时匹配不上，于是永远留在 `EntityLookup` 里；
+            // 又因为 `Entity.world` 是强引用（`entity/mod.rs:720`）而 `EntityLookup`
+            // 持有 `Arc<dyn EntityBase>`（`world/entity_lookup.rs:57-58`），
+            // 形成强引用环，实体连同它引用的一切（AI target、载具、玩家）都不再释放。
+            if chunks_set.contains(&base_entity.chunk_pos.load()) {
                 base_entity.mark_removed(crate::entity::RemovalReason::UnloadedToChunk);
                 true
             } else {

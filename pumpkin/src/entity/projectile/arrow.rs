@@ -95,7 +95,9 @@ impl ArrowEntity {
     pub fn new_shot(entity: Entity, shooter: &Entity, pickup: ArrowPickup) -> Self {
         let mut owner_pos = shooter.pos.load();
         owner_pos.y = owner_pos.y + f64::from(shooter.entity_dimension.load().eye_height) - 0.1;
-        entity.pos.store(owner_pos);
+        // 同上：对齐原版 `AbstractArrow` 构造里的 `this.setPos(x, y, z)`
+        // （`Vanilla/.../projectile/arrow/AbstractArrow.java:106`）。
+        entity.set_pos(owner_pos);
         entity.set_velocity(Vector3::new(0.0, 0.1, 0.0));
 
         Self {

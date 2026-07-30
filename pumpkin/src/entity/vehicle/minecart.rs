@@ -309,7 +309,11 @@ impl EntityBase for MinecartEntity {
                 }
 
                 target_position.y = pos.y;
-                self.vehicle.entity.pos.store(target_position);
+                // 走 `set_pos`：矿车沿轨道移动是高频路径，直接写 `pos` 会让
+                // `chunk_pos` 永久停在出生区块，卸载时匹配不上而泄漏。
+                // 原版这里也是 `this.setPos(x, y, z)`
+                // （`Vanilla/.../vehicle/minecart/OldMinecartBehavior.java:216`）。
+                self.vehicle.entity.set_pos(target_position);
 
                 let horizontal_in_direction = Vector3::new(exit1.x, 0.0, exit1.z);
                 let mut horizontal_out_direction = Vector3::new(exit0.x, 0.0, exit0.z);

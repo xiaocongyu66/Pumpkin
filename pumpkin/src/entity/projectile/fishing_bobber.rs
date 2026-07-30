@@ -34,7 +34,8 @@ impl FishingBobberEntity {
     pub fn new(entity: Entity, owner: &Player) -> Self {
         let mut owner_pos = owner.living_entity.entity.pos.load();
         owner_pos.y += owner.living_entity.entity.get_eye_height() - 0.1;
-        entity.pos.store(owner_pos);
+        // 同上：对齐原版 `FishingHook` 构造里的 `this.setPos(...)`。
+        entity.set_pos(owner_pos);
 
         Self {
             entity,
