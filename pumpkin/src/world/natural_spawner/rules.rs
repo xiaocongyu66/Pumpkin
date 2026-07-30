@@ -298,10 +298,12 @@ fn blocks_building(entity: &dyn EntityBase) -> bool {
         || entity_type == &EntityType::END_CRYSTAL
 }
 
-/// 原版 `NaturalSpawner.isValidPositionForMob`（`NaturalSpawner.java:241`）末尾调用的
+/// 判断候选位置是否未被已有实体占用，对齐原版 `EntityGetter.isUnobstructed`。
+///
+/// 这是原版 `NaturalSpawner.isValidPositionForMob`（`NaturalSpawner.java:241`）末尾调用的
 /// `Mob.checkSpawnObstruction`（`Mob.java:847`）中的 `level.isUnobstructed(this)` 部分，
-/// 实现见 `EntityGetter.isUnobstructed`（`EntityGetter.java:40`）：包围盒内只要存在一个
-/// 未被移除、非旁观者、且 `blocksBuilding` 为真的实体，就判定该位置被占用。
+/// 实现见 `EntityGetter.java:40`：包围盒内只要存在一个未被移除、非旁观者、且
+/// `blocksBuilding` 为真的实体，就判定该位置被占用。
 ///
 /// 需要特别说明的是：原版 `isValidSpawnPostitionForType` 末尾那个
 /// `level.noCollision(getSpawnAABB(..))` **并不能**阻止生物互相重叠 —— 它的实体部分走
@@ -588,8 +590,8 @@ mod tests {
     const _: fn(&World, BlockPos, &'static EntityType) -> BlockPos =
         public_api::adjust_spawn_position;
     const _: fn(&BlockState, &EntityType) -> bool = public_api::is_valid_empty_spawn_block;
-    const _: fn(&World, &dyn EntityBase, &[Arc<dyn EntityBase>]) -> bool =
-        public_api::is_unobstructed_for_spawn;
+    type UnobstructedForSpawnFn = fn(&World, &dyn EntityBase, &[Arc<dyn EntityBase>]) -> bool;
+    const _: UnobstructedForSpawnFn = public_api::is_unobstructed_for_spawn;
     const _: i32 = public_api::NATURAL_SPAWN_CHUNK_RANGE;
     const _: f64 = public_api::SPAWN_DISTANCE_BLOCK_SQ;
 
