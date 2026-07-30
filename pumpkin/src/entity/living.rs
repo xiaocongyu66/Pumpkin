@@ -2875,6 +2875,10 @@ impl EntityBase for LivingEntity {
                 self.tick_movement(server, caller).await;
                 // Vanilla-like order: freeze logic runs after movement/collisions.
                 self.entity.tick_frozen(caller.as_ref()).await;
+                // 原版 LivingEntity#aiStep 在冻结逻辑之后紧跟着 profiler "push" 段并调用
+                // pushEntities（LivingEntity.java:2949），顺序是「移动/碰撞 → 冻结 → 推挤」。
+                // 走 caller 而不是 self，保证矿车等重写过 push_entities 的实体能派发到自己的实现。
+                caller.push_entities(caller).await;
             }
 
             // TODO
