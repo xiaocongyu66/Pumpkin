@@ -385,6 +385,16 @@ pub trait EntityBase: Send + Sync + NBTStorage + std::any::Any {
             let self_entity = self.get_entity();
             let other_entity = entity.get_entity();
 
+            // 原版 LivingEntity#push 覆写：睡着的生物整段 super.push 都不执行
+            // （LivingEntity.java:2218-2222），也就是既不会被推走、也不会反推对方。
+            // 原版判定是 getSleepingPos().isPresent()，Pumpkin 没有实体级的睡眠坐标，
+            // 但基类 Entity 上的 pose 是等价的：玩家（player/movement.rs:98）和村民
+            // （passive/villager/job.rs:145）睡觉时都会置成 EntityPose::Sleeping。
+            // 非生物实体永远不会是这个 pose，所以放在共用默认实现里与原版等价。
+            if self_entity.pose.load() == EntityPose::Sleeping {
+                return;
+            }
+
             if self_entity.no_clip.load(Ordering::Relaxed)
                 || other_entity.no_clip.load(Ordering::Relaxed)
             {
@@ -455,10 +465,6 @@ pub trait EntityBase: Send + Sync + NBTStorage + std::any::Any {
             let mut pushed = false;
             let self_entity = self.get_entity();
             let entity_bb = self_entity.bounding_box.load();
-
-            if !self.is_pushable() {
-                return false;
-            }
 
             let world = self_entity.world.load();
 
@@ -552,21 +558,72 @@ pub trait EntityBase: Send + Sync + NBTStorage + std::any::Any {
                     }
                 }
             } else {
-                let other_entities = world.get_entities_at_box(&entity_bb);
-                for other in other_entities {
-                    if other.get_entity().entity_id != self_entity.entity_id {
-                        dyn_self.push(&other).await;
-                        pushed = true;
+                // 对齐原版 `LivingEntity#pushEntities`（LivingEntity.java:3007-3028）：
+                //   1. 用**未膨胀**的自身碰撞箱取可推挤实体列表
+                //      （Level#getPushableEntities → EntitySelector.pushableBy）；
+                //   2. 列表为空直接返回；
+                //   3. cramming 判定；
+                //   4. 对列表里每个实体执行 doPush。
+
+                // 原版 Player 在 tick 里把 noPhysics 设成 isSpectator()（Player.java:233），
+                // Entity#push 一见 noPhysics 就 return；Pumpkin 的旁观者不设 no_clip，
+                // 所以这里显式挡掉「旁观者去推别人」。
+                if self.is_spectator() {
+                    return false;
+                }
+
+                // 原版 Bat#pushEntities 是空实现（Bat.java:105-107），蝙蝠既不推挤也不吃 cramming；
+                // 原版 ArmorStand#pushEntities（ArmorStand.java:194）只推可载人矿车，不走通用推挤。
+                if self_entity.entity_type.id == EntityType::BAT.id
+                    || self_entity.entity_type.id == EntityType::ARMOR_STAND.id
+                {
+                    return false;
+                }
+
+                // EntitySelector.pushableBy(self)（EntitySelector.java:42-70）：排除旁观者、
+                // 要求目标 isPushable()。队伍 CollisionRule 的 NEVER / PUSH_OWN_TEAM /
+                // PUSH_OTHER_TEAMS 三个分支未建模：查询本身是有的（Scoreboard::get_teams
+                // 配合队伍成员名，见 command/commands/team/mod.rs:79 的记分板名规则），但
+                // world.scoreboard 是 tokio Mutex，而这里是每 tick 每实体的热路径，为一个
+                // 默认全是 ALWAYS 的规则去抢全局锁不划算。等 scoreboard 有免锁快照再补。
+                let mut pushable: Vec<Arc<dyn EntityBase>> = Vec::new();
+                world.extend_entities_in_box_where(&mut pushable, usize::MAX, entity_bb, |other| {
+                    other.get_entity().entity_id != self_entity.entity_id
+                        && !other.is_spectator()
+                        && other.is_pushable()
+                });
+
+                if pushable.is_empty() {
+                    return false;
+                }
+
+                // cramming（LivingEntity.java:3015-3023）：max_entity_cramming 为 0 表示关闭；
+                // 列表长度 > max-1 且 1/4 概率命中时，重新只数「非乘客」实体，仍 > max-1
+                // 才造成 6.0 点 CRAMMING 伤害。
+                let max_cramming = world.level_info.load().game_rules.max_entity_cramming;
+                if max_cramming > 0
+                    && pushable.len() as i64 > max_cramming - 1
+                    && rand::random_range(0..4) == 0
+                {
+                    let mut count: i64 = 0;
+                    for other in &pushable {
+                        if !other.is_passenger().await {
+                            count += 1;
+                        }
+                    }
+                    if count > max_cramming - 1 {
+                        dyn_self
+                            .damage(&**dyn_self, 6.0, DamageType::CRAMMING)
+                            .await;
                     }
                 }
 
-                let players = world.get_players_at_box(&entity_bb);
-                for player in players {
-                    if player.get_entity().entity_id != self_entity.entity_id {
-                        let player_base: Arc<dyn EntityBase> = player.clone();
-                        dyn_self.push(&player_base).await;
-                        pushed = true;
-                    }
+                // 原版 doPush 是 `entity.push(this)`（LivingEntity.java:3052-3054）：接收者是
+                // 被找到的那个实体，自己只是参数。这样 LivingEntity#push 的睡眠判定
+                // （LivingEntity.java:2219）落在被找到的实体身上，顺序不能反。
+                for other in pushable {
+                    other.push(dyn_self).await;
+                    pushed = true;
                 }
             }
 

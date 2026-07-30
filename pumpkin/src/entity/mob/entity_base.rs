@@ -189,6 +189,14 @@ impl<T: Mob + Send + 'static> EntityBase for T {
         true
     }
 
+    /// 原版 `Mob` 不覆写 `isPushable()`，直接继承 `LivingEntity#isPushable`
+    /// （`LivingEntity.java:3145`：`isAlive() && !isSpectator() && !onClimbable()`）。
+    /// 这个 blanket impl 如果不显式转发，所有生物都会落到 `EntityBase` 的默认值
+    /// `false`，于是永远不参与推挤（铁傀儡叠在同一格就是这么来的）。
+    fn is_pushable(&self) -> bool {
+        self.get_mob_entity().living_entity.is_pushable()
+    }
+
     fn can_hit(&self) -> bool {
         true
     }
