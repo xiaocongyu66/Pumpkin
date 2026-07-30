@@ -1,5 +1,8 @@
 use crate::entity::EntityBase;
+use crate::entity::decoration::armor_stand::ArmorStandEntity;
 use crate::entity::r#type::check_spawn_rules;
+use crate::entity::vehicle::boat::BoatEntity;
+use crate::entity::vehicle::minecart::MinecartEntity;
 use crate::world::World;
 use pumpkin_data::biome::Spawner;
 use pumpkin_data::chunk::Biome;
@@ -270,6 +273,84 @@ pub fn is_valid_spawn_position_for_type(
     true
 }
 
+/// 对应原版 `Entity.blocksBuilding` 字段。
+///
+/// 原版在 `LivingEntity`（`LivingEntity.java:327`）、`FallingBlockEntity`、`PrimedTnt`、
+/// `EndCrystal`、`AbstractMinecart`、`AbstractBoat` 的构造里把它置为 `true`；
+/// `ArmorStand` 则是 `blocksBuilding = !isMarker()`（`ArmorStand.java:626`）。
+/// 只有它为 `true` 的实体才会在 `EntityGetter.isUnobstructed` 里挡住生成。
+fn blocks_building(entity: &dyn EntityBase) -> bool {
+    // 展示架是 marker 时不挡建造，也就不挡生成。
+    if let Some(armor_stand) = entity.cast_any().downcast_ref::<ArmorStandEntity>() {
+        return !armor_stand.is_marker();
+    }
+    // 所有 LivingEntity（含玩家与全部生物）都挡住生成 —— 这正是原版阻止同群怪物
+    // 叠在同一格的机制。
+    if entity.get_living_entity().is_some() {
+        return true;
+    }
+    if entity.cast_any().is::<BoatEntity>() || entity.cast_any().is::<MinecartEntity>() {
+        return true;
+    }
+    let entity_type = entity.get_entity().entity_type;
+    entity_type == &EntityType::FALLING_BLOCK
+        || entity_type == &EntityType::TNT
+        || entity_type == &EntityType::END_CRYSTAL
+}
+
+/// 原版 `NaturalSpawner.isValidPositionForMob`（`NaturalSpawner.java:241`）末尾调用的
+/// `Mob.checkSpawnObstruction`（`Mob.java:847`）中的 `level.isUnobstructed(this)` 部分，
+/// 实现见 `EntityGetter.isUnobstructed`（`EntityGetter.java:40`）：包围盒内只要存在一个
+/// 未被移除、非旁观者、且 `blocksBuilding` 为真的实体，就判定该位置被占用。
+///
+/// 需要特别说明的是：原版 `isValidSpawnPostitionForType` 末尾那个
+/// `level.noCollision(getSpawnAABB(..))` **并不能**阻止生物互相重叠 —— 它的实体部分走
+/// `EntitySelector.CAN_BE_COLLIDED_WITH`（`EntitySelector.java:31`），最终调用
+/// `Entity.canBeCollidedWith(null)`，而该方法在 `Entity.java:2270` 默认返回 `false`，
+/// 只有船 / 潜影贝 / 快乐恶魂重写过。所以同群怪物不叠在一格，靠的完全是这里的
+/// `isUnobstructed`。
+///
+/// `pending` 是本批次已生成、但尚未由 `tick.rs` 写入世界的同群成员。原版是边生成边
+/// `addFreshEntityWithPassengers`，后生成的成员立刻就能"看见"先生成的；Pumpkin 走批量
+/// 缓冲，因此必须把缓冲区一并纳入判定，否则同一 pack 内部依旧会叠在一起。
+///
+/// 注意：`checkSpawnObstruction` 的另一半 `!level.containsAnyLiquid(bb)` 未在此实现 ——
+/// 原版有大量水生 / 岩浆生物（`WaterAnimal`、`Drowned`、`Guardian`、`Axolotl`、`Strider`
+/// 等）重写掉了这一半，按类逐个对齐超出本次修复范围；且 Pumpkin 的
+/// `is_valid_empty_spawn_block` 已经拒绝液体方块，陆生生物不受影响。
+#[must_use]
+pub fn is_unobstructed_for_spawn(
+    world: &World,
+    entity: &dyn EntityBase,
+    pending: &[Arc<dyn EntityBase>],
+) -> bool {
+    let bounding_box = entity.get_entity().bounding_box.load();
+
+    // getEntities(source, bb) 自带 EntitySelector.NO_SPECTATORS，故排除旁观者。
+    let blocks_spawn = |candidate: &dyn EntityBase| {
+        let other = candidate.get_entity();
+        if other.is_removed() {
+            return false;
+        }
+        if candidate
+            .get_player()
+            .is_some_and(|player| player.gamemode.load() == GameMode::Spectator)
+        {
+            return false;
+        }
+        blocks_building(candidate) && other.bounding_box.load().intersects(&bounding_box)
+    };
+
+    // 先查同批次缓冲（廉价），再查世界中已存在的实体。
+    if pending.iter().any(|other| blocks_spawn(other.as_ref())) {
+        return false;
+    }
+    !world
+        .get_all_at_box(&bounding_box)
+        .iter()
+        .any(|other| blocks_spawn(other.as_ref()))
+}
+
 pub fn is_spawn_position_ok(
     world: &Arc<World>,
     block_pos: &BlockPos,
@@ -507,8 +588,27 @@ mod tests {
     const _: fn(&World, BlockPos, &'static EntityType) -> BlockPos =
         public_api::adjust_spawn_position;
     const _: fn(&BlockState, &EntityType) -> bool = public_api::is_valid_empty_spawn_block;
+    const _: fn(&World, &dyn EntityBase, &[Arc<dyn EntityBase>]) -> bool =
+        public_api::is_unobstructed_for_spawn;
     const _: i32 = public_api::NATURAL_SPAWN_CHUNK_RANGE;
     const _: f64 = public_api::SPAWN_DISTANCE_BLOCK_SQ;
+
+    /// 现场报告里约 10 只 husk 叠在同一格。`is_unobstructed_for_spawn` 靠包围盒相交来
+    /// 拒绝这种位置，所以这里固定住它依赖的几何前提：同一格必然相交（会被拒绝），
+    /// 相邻格互不相交（原版散布后应有的样子）。
+    #[test]
+    fn husk_spawn_boxes_overlap_on_same_block_but_not_one_block_apart() {
+        let size = EntityDimensions {
+            width: EntityType::HUSK.dimension[0],
+            height: EntityType::HUSK.dimension[1],
+            eye_height: EntityType::HUSK.eye_height,
+        };
+        let at = |x: f64, z: f64| BoundingBox::new_from_pos(x + 0.5, 64.0, z + 0.5, &size);
+
+        assert!(at(10.0, 20.0).intersects(&at(10.0, 20.0)));
+        assert!(!at(10.0, 20.0).intersects(&at(11.0, 20.0)));
+        assert!(!at(10.0, 20.0).intersects(&at(10.0, 21.0)));
+    }
 
     #[test]
     fn redstone_conductors_are_not_limited_to_full_cubes() {

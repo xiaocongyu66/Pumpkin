@@ -18,7 +18,7 @@ use super::rules::{
     adjust_spawn_position_cache, choose_weighted_spawner_with_random_impl, get_nearest_player,
     get_random_spawn_mob_at_with_random, is_redstone_conductor,
     is_right_distance_to_player_and_spawn_point, is_spawn_position_ok_cache,
-    is_valid_spawn_position_for_type, spawner_is_in_biome_pool,
+    is_unobstructed_for_spawn, is_valid_spawn_position_for_type, spawner_is_in_biome_pool,
 };
 use super::state::SpawnState;
 
@@ -354,6 +354,16 @@ pub fn spawn_category_for_position(
             entity
                 .get_entity()
                 .set_rotation(random.random::<f32>() * 360., 0.);
+
+            // 原版 NaturalSpawner.spawnCategoryForPosition 在 getMobForSpawn + snapTo 之后
+            // 还要过一道 isValidPositionForMob（NaturalSpawner.java:241），其中的
+            // Mob.checkSpawnObstruction -> EntityGetter.isUnobstructed 会拒绝与已有实体
+            // 重叠的位置。缺了这一步，同群的怪物就会全部落在同一格上。
+            // 与原版一致：失败同样消耗一次重试（inc += 1），而不是 break。
+            if !is_unobstructed_for_spawn(world, entity.as_ref(), &batch_buffer) {
+                inc += 1;
+                continue;
+            }
 
             spawn_cluster_size += 1;
             spawn_state.after_spawn(entity.as_ref(), world);
