@@ -7,11 +7,16 @@
 
 use std::sync::{Arc, Weak};
 
-use pumpkin_data::entity::EntityType;
+use pumpkin_data::{
+    entity::EntityType,
+    item::Item,
+    item_stack::ItemStack,
+    sound::{Sound, SoundCategory},
+};
 use pumpkin_nbt::compound::NbtCompound;
 
 use crate::entity::{
-    Entity, NBTStorage, NbtFuture,
+    Entity, EntityBaseFuture, NBTStorage, NbtFuture,
     ai::{
         goal::{
             active_target::ActiveTargetGoal, defend_villagers::DefendVillagersGoal,
@@ -23,7 +28,11 @@ use crate::entity::{
         vanilla_enemy::{IRON_GOLEM_ENEMY_EXCLUDES, IRON_GOLEM_TARGET_CHANCE},
     },
     mob::{Mob, MobEntity},
+    player::Player,
 };
+
+/// 铁锭修复铁傀儡的治疗量（原版 `IRON_INGOT_HEAL_AMOUNT`）。
+const IRON_INGOT_HEAL_AMOUNT: f32 = 25.0;
 
 /// Iron golem — Vanilla 26.2 `IronGolem`.
 ///
@@ -143,5 +152,57 @@ impl NBTStorage for IronGolemEntity {
 impl Mob for IronGolemEntity {
     fn get_mob_entity(&self) -> &MobEntity {
         &self.mob_entity
+    }
+
+    /// 原版 `IronGolem.mobInteract`（26.2，IronGolem.java:266-280）。
+    ///
+    /// ```text
+    /// if (!itemStack.is(Items.IRON_INGOT)) return PASS;
+    /// float healthBefore = getHealth();
+    /// heal(25.0f);
+    /// if (getHealth() == healthBefore) return PASS;   // 满血时不消耗铁锭
+    /// float pitch = 1.0f + (random.nextFloat() - random.nextFloat()) * 0.2f;
+    /// playSound(IRON_GOLEM_REPAIR, 1.0f, pitch);
+    /// itemStack.consume(1, player);
+    /// return SUCCESS;
+    /// ```
+    fn mob_interact<'a>(
+        &'a self,
+        player: &'a Arc<Player>,
+        item_stack: &'a mut ItemStack,
+    ) -> EntityBaseFuture<'a, bool> {
+        Box::pin(async move {
+            // 非铁锭：走默认交互（拴绳等）。
+            if item_stack.item != &Item::IRON_INGOT {
+                return self.mob_entity.mob_interact(player, item_stack).await;
+            }
+
+            let living = &self.mob_entity.living_entity;
+            let health_before = living.health.load();
+            // heal() 内部断言 additional_health > 0 并夹取到最大生命值。
+            living.heal(IRON_INGOT_HEAL_AMOUNT);
+            if living.health.load() == health_before {
+                // 已满血：不播放音效也不消耗铁锭（原版返回 PASS）。
+                return false;
+            }
+
+            let entity = &living.entity;
+            let pitch = {
+                use rand::RngExt;
+                let mut rng = rand::rng();
+                1.0 + (rng.random::<f32>() - rng.random::<f32>()) * 0.2
+            };
+            entity.world.load().play_sound_fine(
+                Sound::EntityIronGolemRepair,
+                SoundCategory::Neutral,
+                &entity.pos.load(),
+                1.0,
+                pitch,
+            );
+
+            // 原版 consume(1, player)：创造模式不扣物品。
+            item_stack.decrement_unless_creative(player.gamemode.load(), 1);
+            true
+        })
     }
 }
