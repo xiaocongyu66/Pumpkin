@@ -385,6 +385,16 @@ pub trait EntityBase: Send + Sync + NBTStorage + std::any::Any {
             let self_entity = self.get_entity();
             let other_entity = entity.get_entity();
 
+            // 原版 LivingEntity#push 覆写：睡着的生物整段 super.push 都不执行
+            // （LivingEntity.java:2218-2222），也就是既不会被推走、也不会反推对方。
+            // 原版判定是 getSleepingPos().isPresent()，Pumpkin 没有实体级的睡眠坐标，
+            // 但基类 Entity 上的 pose 是等价的：玩家（player/movement.rs:98）和村民
+            // （passive/villager/job.rs:145）睡觉时都会置成 EntityPose::Sleeping。
+            // 非生物实体永远不会是这个 pose，所以放在共用默认实现里与原版等价。
+            if self_entity.pose.load() == EntityPose::Sleeping {
+                return;
+            }
+
             if self_entity.no_clip.load(Ordering::Relaxed)
                 || other_entity.no_clip.load(Ordering::Relaxed)
             {
@@ -571,8 +581,11 @@ pub trait EntityBase: Send + Sync + NBTStorage + std::any::Any {
                 }
 
                 // EntitySelector.pushableBy(self)（EntitySelector.java:42-70）：排除旁观者、
-                // 要求目标 isPushable()。队伍 CollisionRule 那几个分支 Pumpkin 侧没有
-                // 「实体 → 队伍」查询，暂不建模。
+                // 要求目标 isPushable()。队伍 CollisionRule 的 NEVER / PUSH_OWN_TEAM /
+                // PUSH_OTHER_TEAMS 三个分支未建模：查询本身是有的（Scoreboard::get_teams
+                // 配合队伍成员名，见 command/commands/team/mod.rs:79 的记分板名规则），但
+                // world.scoreboard 是 tokio Mutex，而这里是每 tick 每实体的热路径，为一个
+                // 默认全是 ALWAYS 的规则去抢全局锁不划算。等 scoreboard 有免锁快照再补。
                 let mut pushable: Vec<Arc<dyn EntityBase>> = Vec::new();
                 world.extend_entities_in_box_where(&mut pushable, usize::MAX, entity_bb, |other| {
                     other.get_entity().entity_id != self_entity.entity_id
