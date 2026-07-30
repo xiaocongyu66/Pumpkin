@@ -2652,6 +2652,18 @@ impl Entity {
         }
     }
 
+    /// 原版 `Entity.unsetRemoved`（Entity.java:3764，`this.removalReason = null`）。
+    ///
+    /// 清掉移除标记，让实体重新变成「在世」状态。原版只在玩家复活/换维度这类
+    /// 「同一个实体重新入场」的路径上调用（见 `ServerPlayer.teleport`
+    /// ServerPlayer.java:1106）。原版 `PlayerList.respawn` 走的是另一条路——直接
+    /// new 一个 `ServerPlayer` 并沿用旧 id，效果等价于把移除标记清零；我们复用
+    /// 同一个 `Arc<Player>`，所以必须显式 unset，否则 `is_removed()` 会永久为真。
+    pub fn unset_removed(&self) {
+        self.removal_reason.store(None);
+        self.removed.store(false, Ordering::Relaxed);
+    }
+
     /// Removes the `Entity` from their current `World`.
     ///
     /// Sets `removed` / `removal_reason` so concurrent entity ticks (which hold a
