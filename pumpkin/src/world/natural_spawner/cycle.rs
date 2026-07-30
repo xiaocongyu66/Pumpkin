@@ -287,6 +287,10 @@ pub fn spawn_category_for_position(
         let mut current_spawner = None;
 
         while inc < random_group_size {
+            // 原版 NaturalSpawner.java:163 的散布公式，逐字对齐：偏移量叠加在**上一只**的
+            // 坐标上（累积随机游走，单步 -5..+5，期望 0），不是每次都从 start 重新随机。
+            // 因此原版 pack 天生就是几格范围内的密集小群，「挨得很近」是设计如此，不要
+            // 改成更分散的算法，否则生成分布会偏离原版。
             new_x += random.random_range(0..6) - random.random_range(0..6);
             new_z += random.random_range(0..6) - random.random_range(0..6);
             // Vanilla keeps pack Y at yStart (no vertical crawl).
@@ -358,7 +362,7 @@ pub fn spawn_category_for_position(
             // 原版 NaturalSpawner.spawnCategoryForPosition 在 getMobForSpawn + snapTo 之后
             // 还要过一道 isValidPositionForMob（NaturalSpawner.java:241），其中的
             // Mob.checkSpawnObstruction -> EntityGetter.isUnobstructed 会拒绝与已有实体
-            // 重叠的位置。缺了这一步，同群的怪物就会全部落在同一格上。
+            // 重叠的位置。缺了这一步，同群的怪物就可能落在互相重叠的坐标上。
             // 与原版一致：失败同样消耗一次重试（inc += 1），而不是 break。
             if !is_unobstructed_for_spawn(world, entity.as_ref(), &batch_buffer) {
                 inc += 1;

@@ -285,7 +285,7 @@ fn blocks_building(entity: &dyn EntityBase) -> bool {
         return !armor_stand.is_marker();
     }
     // 所有 LivingEntity（含玩家与全部生物）都挡住生成 —— 这正是原版阻止同群怪物
-    // 叠在同一格的机制。
+    // 包围盒互相重叠的机制。
     if entity.get_living_entity().is_some() {
         return true;
     }
@@ -309,12 +309,17 @@ fn blocks_building(entity: &dyn EntityBase) -> bool {
 /// `level.noCollision(getSpawnAABB(..))` **并不能**阻止生物互相重叠 —— 它的实体部分走
 /// `EntitySelector.CAN_BE_COLLIDED_WITH`（`EntitySelector.java:31`），最终调用
 /// `Entity.canBeCollidedWith(null)`，而该方法在 `Entity.java:2270` 默认返回 `false`，
-/// 只有船 / 潜影贝 / 快乐恶魂重写过。所以同群怪物不叠在一格，靠的完全是这里的
+/// 只有船 / 潜影贝 / 快乐恶魂重写过。所以同群怪物的包围盒不互相重叠，靠的完全是这里的
 /// `isUnobstructed`。
+///
+/// 另外要明确：原版 pack 的散布本身就很密（`NaturalSpawner.java:163` 的
+/// `x += nextInt(6) - nextInt(6)` 是从上一只的位置继续走的累积随机游走，y 固定在
+/// `yStart`），所以「一群怪挨得很近」是原版设计，不是 bug；这里修的是缺少重叠判定
+/// 导致的**包围盒相交**。
 ///
 /// `pending` 是本批次已生成、但尚未由 `tick.rs` 写入世界的同群成员。原版是边生成边
 /// `addFreshEntityWithPassengers`，后生成的成员立刻就能"看见"先生成的；Pumpkin 走批量
-/// 缓冲，因此必须把缓冲区一并纳入判定，否则同一 pack 内部依旧会叠在一起。
+/// 缓冲，因此必须把缓冲区一并纳入判定，否则同一 pack 内部依旧会互相重叠。
 ///
 /// 注意：`checkSpawnObstruction` 的另一半 `!level.containsAnyLiquid(bb)` 未在此实现 ——
 /// 原版有大量水生 / 岩浆生物（`WaterAnimal`、`Drowned`、`Guardian`、`Axolotl`、`Strider`
@@ -595,9 +600,13 @@ mod tests {
     const _: i32 = public_api::NATURAL_SPAWN_CHUNK_RANGE;
     const _: f64 = public_api::SPAWN_DISTANCE_BLOCK_SQ;
 
-    /// 现场报告里约 10 只 husk 叠在同一格。`is_unobstructed_for_spawn` 靠包围盒相交来
-    /// 拒绝这种位置，所以这里固定住它依赖的几何前提：同一格必然相交（会被拒绝），
-    /// 相邻格互不相交（原版散布后应有的样子）。
+    /// 固定住 `is_unobstructed_for_spawn` 依赖的几何前提。
+    ///
+    /// 它完全靠包围盒相交来拒绝位置：同一格必然相交（会被拒绝），相邻格互不相交（不拦）。
+    ///
+    /// 这也说明了修复的边界：现场报告的 husk 是「挨得很近但不同格」，相邻格属于原版
+    /// 累积随机游走（`NaturalSpawner.java:163`）的正常结果，本判定不会、也不该拦它；
+    /// 被拦掉的只有真正重叠的位置。
     #[test]
     fn husk_spawn_boxes_overlap_on_same_block_but_not_one_block_apart() {
         let size = EntityDimensions {
