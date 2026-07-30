@@ -250,6 +250,85 @@ pub trait EntityBase: Send + Sync + NBTStorage + std::any::Any {
         false
     }
 
+    /// 原版 `Entity.canInteractWithLevel`（Entity.java:389-391）：
+    /// `isAlive() && !isRemoved() && !isSpectator()`。
+    ///
+    /// Pumpkin 的 [`Entity::is_alive`] 只看 `removal_reason`（mod.rs:3196），
+    /// 不含血量判定；原版 `LivingEntity.isAlive`（LivingEntity.java:1639-1641）
+    /// 还要求 `getHealth() > 0`，所以生物额外从 [`LivingEntity::health`] 取血量。
+    /// 非生物实体（拴绳结、船等）没有血量，只看移除标记。
+    fn can_interact_with_level(&self) -> bool {
+        !self.get_entity().is_removed()
+            && !self.is_spectator()
+            && self
+                .get_living_entity()
+                .is_none_or(|living| living.health.load() > 0.0)
+    }
+
+    /// 原版 `Entity.notifyLeasheeRemoved`（Entity.java:3667-3668，基类空实现）。
+    /// 在本实体作为 leash holder、其被拴实体解除拴绳后触发。
+    fn notify_leashee_removed(&self) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
+    /// 原版 `Leashable.onLeashRemoved`（Leashable.java:125-126，接口空实现）。
+    /// 本实体自己的拴绳被解除后触发。
+    fn on_leash_removed(&self) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
+    /// 成功骑乘载具后触发。对应原版 `Entity.startRiding` 的虚派发尾部；
+    /// 基类什么都不做，`Mob` 覆写会在被拴时 `dropLeash()`（Mob.java:1315-1320）。
+    fn on_start_riding(&self) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
+    /// 原版 `Leashable.leashTooFarBehaviour`（Leashable.java:211-213）：
+    /// 默认就是 `dropLeash()`，即断绳并掉落 lead。
+    fn leash_too_far_behaviour(&self) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async move { self.drop_leash().await })
+    }
+
+    /// 原版 `Leashable.dropLeash()`（Leashable.java:119-121）：
+    /// `dropLeash(this, true, true)` —— 同步给客户端并掉落 lead 物品。
+    fn drop_leash(&self) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async move { self.unleash_with(true, true).await })
+    }
+
+    /// 原版 `Leashable.removeLeash()`（Leashable.java:123-124）：
+    /// `dropLeash(this, true, false)` —— 同步给客户端但**不**掉落 lead。
+    fn remove_leash(&self) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async move { self.unleash_with(true, false).await })
+    }
+
+    /// 原版 `Leashable.dropLeash(entity, sendPacket, dropLead)`（Leashable.java:128-146）。
+    ///
+    /// 顺序与原版一致：先清 leash 数据，再 `onLeashRemoved()`，然后按 `dropLead`
+    /// 掉落 lead、按 `sendPacket` 广播解绑包，最后通知 holder
+    /// `notifyLeasheeRemoved()`（Leashable.java:147）。
+    fn unleash_with(&self, send_packet: bool, drop_lead: bool) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async move {
+            let entity = self.get_entity();
+            let old_holder = entity.leashed_to.lock().await.take();
+            let Some(old_holder) = old_holder else {
+                return;
+            };
+
+            self.on_leash_removed().await;
+
+            let world = entity.world.load();
+            if drop_lead {
+                let lead = ItemStack::new(1, &pumpkin_data::item::Item::LEAD);
+                world.drop_stack(&entity.block_pos.load(), lead).await;
+            }
+            if send_packet {
+                entity.broadcast_unleash();
+            }
+
+            old_holder.notify_leashee_removed().await;
+        })
+    }
+
     fn is_collidable(&self, _entity: Option<Box<dyn EntityBase>>) -> bool {
         false
     }
@@ -3199,6 +3278,8 @@ impl Entity {
 
     pub const LEASH_SNAP_DISTANCE: f64 = 12.0;
     pub const LEASH_ELASTIC_DISTANCE: f64 = 6.0;
+    /// 原版 `Leashable.STIFFNESS`（Leashable.java:43）。
+    pub const LEASH_STIFFNESS: f64 = 0.11;
 
     pub async fn leash_to(&self, holder: Arc<dyn EntityBase>) {
         let holder_entity = holder.get_entity();
@@ -3234,6 +3315,13 @@ impl Entity {
             return;
         }
 
+        self.broadcast_unleash();
+    }
+
+    /// 广播解绑包（原版 `dropLeash` 里 `sendPacket` 分支发的
+    /// `ClientboundSetEntityLinkPacket(entity, null)`，Leashable.java:141-143）。
+    /// 从 [`Self::unleash`] 抽出来，供 [`EntityBase::unleash_with`] 复用。
+    pub fn broadcast_unleash(&self) {
         let je_packet =
             pumpkin_protocol::java::client::play::CSetEntityLink::new(self.entity_id, -1);
         let be_packet = pumpkin_protocol::bedrock::client::CSetActorLink {
@@ -3254,43 +3342,125 @@ impl Entity {
         );
     }
 
-    pub async fn tick_leash(&self) {
+    /// 原版 `Leashable.dropLeash(entity, true, drop_lead)`（Leashable.java:128-147）的
+    /// 固有方法版本，供只持有 [`Entity`] / [`crate::entity::mob::MobEntity`]
+    /// （两者都不是 `EntityBase`）的调用点使用。
+    ///
+    /// 与 [`EntityBase::unleash_with`] 的唯一差别：无法虚派发 `onLeashRemoved()`，
+    /// 调用方需要自己处理对应的钩子。
+    pub async fn drop_leash_inherent(&self, drop_lead: bool) {
+        let old_holder = self.leashed_to.lock().await.take();
+        let Some(old_holder) = old_holder else {
+            return;
+        };
+
+        if drop_lead {
+            let lead = ItemStack::new(1, &pumpkin_data::item::Item::LEAD);
+            self.world
+                .load()
+                .drop_stack(&self.block_pos.load(), lead)
+                .await;
+        }
+        self.broadcast_unleash();
+
+        old_holder.notify_leashee_removed().await;
+    }
+
+    /// 原版 `Leashable.leashableLeashedTo`（Leashable.java:390-392）：
+    /// 扫描以本实体碰撞箱中心为心的 32×32×32 区域，返回所有拴在本实体上的实体。
+    ///
+    /// 原版同样没有反向列表，`notifyLeasheeRemoved` 走的就是这个区域扫描
+    /// （见 `LeashFenceKnotEntity.notifyLeasheeRemoved`，LeashFenceKnotEntity.java:115-120）。
+    #[must_use]
+    pub fn leashable_leashed_to(&self) -> Vec<Arc<dyn EntityBase>> {
+        const SCAN_SIZE: f64 = 32.0;
+        let bb = self.bounding_box.load();
+        let center = (bb.min + bb.max) * 0.5;
+        let half = SCAN_SIZE / 2.0;
+        let scan_box = BoundingBox::new(
+            Vector3::new(center.x - half, center.y - half, center.z - half),
+            Vector3::new(center.x + half, center.y + half, center.z + half),
+        );
+
+        let self_id = self.entity_id;
+        self.world
+            .load()
+            .get_entities_at_box(&scan_box)
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .get_entity()
+                    .leashed_to
+                    .try_lock()
+                    .ok()
+                    .and_then(|guard| {
+                        guard
+                            .as_ref()
+                            .map(|holder| holder.get_entity().entity_id == self_id)
+                    })
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// 原版 `Leashable.tickLeash`（Leashable.java:149-181）。
+    ///
+    /// `dyn_self` 必须是本实体自己的 `EntityBase`，用于把
+    /// `dropLeash` / `removeLeash` / `leashTooFarBehaviour` 派发到具体实体的覆写上。
+    pub async fn tick_leash(&self, dyn_self: &dyn EntityBase) {
         let holder = {
             let guard = self.leashed_to.lock().await;
             guard.clone()
         };
 
-        if let Some(holder) = holder {
-            let holder_entity = holder.get_entity();
+        let Some(holder) = holder else {
+            return;
+        };
+        let holder_entity = holder.get_entity();
 
-            // Drop leash if entity or holder is removed or dead
-            if !self.is_alive() || !holder_entity.is_alive() {
-                self.unleash().await;
-                return;
+        // 原版 Leashable.java:157-163：自己或 holder 任一方无法与世界交互
+        // （死亡 / 已移除 / 旁观者）时断绳，是否掉落 lead 由 ENTITY_DROPS gamerule 决定。
+        if !dyn_self.can_interact_with_level() || !holder.can_interact_with_level() {
+            let entity_drops = self.world.load().level_info.load().game_rules.entity_drops;
+            if entity_drops {
+                dyn_self.drop_leash().await;
+            } else {
+                dyn_self.remove_leash().await;
             }
+            // 原版此处不 return，但 leash 数据已清空，随后的 `getLeashHolder()`
+            // 返回 null 让后续逻辑整体跳过，等价于提前返回。
+            return;
+        }
 
-            let self_pos = self.pos.load();
-            let holder_pos = holder_entity.pos.load();
-            let diff = self_pos - holder_pos;
-            let distance = diff.length();
+        // 原版 Leashable.java:164：holder 必须在同一维度。
+        if !Arc::ptr_eq(&self.world.load_full(), &holder_entity.world.load_full()) {
+            return;
+        }
 
-            if distance > Self::LEASH_SNAP_DISTANCE {
-                // Too far: snap/break leash and drop lead item
-                self.unleash().await;
-                let lead_item =
-                    pumpkin_data::item_stack::ItemStack::new(1, &pumpkin_data::item::Item::LEAD);
-                self.world
-                    .load()
-                    .drop_stack(&self.block_pos.load(), lead_item)
-                    .await;
-            } else if distance > Self::LEASH_ELASTIC_DISTANCE {
-                // Elastic pull force towards leash holder
-                let dir = (holder_pos - self_pos).normalize();
-                let pull_strength = (distance - Self::LEASH_ELASTIC_DISTANCE) * 0.11;
-                let current_vel = self.velocity.load();
-                self.velocity.store(current_vel + dir * pull_strength);
-                self.velocity_dirty.store(true, Relaxed);
-            }
+        let self_pos = self.pos.load();
+        let holder_pos = holder_entity.pos.load();
+        let distance = (self_pos - holder_pos).length();
+
+        if distance > Self::LEASH_SNAP_DISTANCE {
+            // 原版 Leashable.java:168-170：超过 snap 距离先放 lead.break 音效，
+            // 再走 leashTooFarBehaviour()（默认 dropLeash，Mob 覆写还会禁用 MOVE 控制）。
+            self.world.load().play_sound(
+                Sound::ItemLeadBreak,
+                SoundCategory::Neutral,
+                &holder_pos,
+            );
+            dyn_self.leash_too_far_behaviour().await;
+        } else if distance
+            > Self::LEASH_ELASTIC_DISTANCE
+                - f64::from(holder_entity.width())
+                - f64::from(self.width())
+        {
+            // 原版 Leashable.java:171-172：弹性拉拽，阈值要扣掉双方碰撞箱宽度。
+            let dir = (holder_pos - self_pos).normalize();
+            let pull_strength = (distance - Self::LEASH_ELASTIC_DISTANCE) * Self::LEASH_STIFFNESS;
+            let current_vel = self.velocity.load();
+            self.velocity.store(current_vel + dir * pull_strength);
+            self.velocity_dirty.store(true, Relaxed);
         }
     }
 
@@ -3311,13 +3481,14 @@ impl Entity {
         let passenger_entity = passenger.get_entity();
         *passenger_entity.vehicle.lock().await = Some(vehicle);
 
-        let mut passengers = self.passengers.lock().await;
-        passengers.push(passenger);
-
-        let passenger_ids: Vec<VarInt> = passengers
-            .iter()
-            .map(|p| VarInt(p.get_entity().entity_id))
-            .collect();
+        let passenger_ids: Vec<VarInt> = {
+            let mut passengers = self.passengers.lock().await;
+            passengers.push(passenger.clone());
+            passengers
+                .iter()
+                .map(|p| VarInt(p.get_entity().entity_id))
+                .collect()
+        };
 
         let world = self.world.load();
         let chunk_pos = self.chunk_pos.load();
@@ -3325,6 +3496,10 @@ impl Entity {
             chunk_pos,
             &CSetPassengers::new(VarInt(self.entity_id), &passenger_ids),
         );
+
+        // 原版 `Mob.startRiding`（Mob.java:1315-1320）：上载具成功后若还被拴着，
+        // 就 dropLeash()。Pumpkin 的骑乘入口是 add_passenger，所以在这里派发。
+        passenger.on_start_riding().await;
     }
 
     #[allow(clippy::too_many_lines)]
