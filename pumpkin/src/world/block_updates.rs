@@ -470,6 +470,13 @@ impl World {
             .light_engine
             .update_lighting_at(&self.level, *position);
 
+        // 原版 `Level.setBlock` 的最后一步是 `updatePOIOnBlockStateChange`
+        // (`/root/Vanilla/src/net/minecraft/world/level/Level.java:258`)。放在这里
+        // 同样是为了让 `on_state_replaced` 之类自己会锁 `portal_poi` 的回调先跑完
+        // 并释放锁 —— 那把锁不可重入。
+        self.update_poi_on_block_state_change(position, replaced_block_state_id, block_state_id)
+            .await;
+
         replaced_block_state_id
     }
 

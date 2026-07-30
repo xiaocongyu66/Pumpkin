@@ -56,6 +56,7 @@ mod broadcast;
 mod chunks;
 mod collision;
 mod entities;
+mod poi;
 mod player_bedrock;
 mod player_java;
 mod players;
@@ -138,6 +139,12 @@ pub struct World {
     block_update_flush_lock: Mutex<()>,
     /// POI storage for fast portal lookups
     pub portal_poi: Mutex<portal::PortalPoiStorage>,
+    /// 新就绪区块的广播，用来重建它们的 POI 索引。
+    ///
+    /// 对应原版读盘时逐 section 调 `PoiManager.checkConsistencyWithBlocks`
+    /// (`SerializableChunkData.java:190`)。Pumpkin 的区块加载是异步的，所以改成
+    /// 订阅区块就绪事件，在世界 tick 里统一消化，见 `World::tick_poi_chunk_loads`。
+    poi_chunk_listener: crossbeam::channel::Receiver<(Vector2<i32>, Weak<pumpkin_world::chunk::ChunkData>)>,
     /// End Dragon fight manager (only present in `THE_END` dimension).
     pub dragon_fight: Option<Mutex<dragon_fight::DragonFight>>,
     pub spawn_state: ArcSwap<SpawnState>,
@@ -182,6 +189,10 @@ impl World {
 
         // Load portal POI from disk (PoiStorage::new automatically loads from disk if files exist)
         let portal_poi = portal::PortalPoiStorage::new(level.level_folder.poi_folder.clone());
+        // 订阅区块就绪事件，用来重建 POI 索引（原版
+        // `SerializableChunkData.java:190` 的读盘一致性检查）。必须在世界构造时
+        // 就订阅，否则早期加载的区块不会被扫描。
+        let poi_chunk_listener = level.chunk_listener.add_global_chunk_listener();
         let dragon_fight = (dimension.minecraft_name == Dimension::THE_END.minecraft_name)
             .then(|| Mutex::new(dragon_fight::DragonFight::new()));
         Self {
@@ -206,6 +217,7 @@ impl World {
             unsent_block_entity_updates: std::sync::Mutex::new(FxHashSet::default()),
             block_update_flush_lock: Mutex::new(()),
             portal_poi: Mutex::new(portal_poi),
+            poi_chunk_listener,
             dragon_fight,
             spawn_state: ArcSwap::new(Arc::new(SpawnState::empty())),
             active_chunks: ArcSwap::new(Arc::new(FxHashSet::default())),

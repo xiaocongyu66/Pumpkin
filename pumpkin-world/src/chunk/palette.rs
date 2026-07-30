@@ -764,6 +764,22 @@ impl BlockPalette {
         }
     }
 
+    /// 原版 `PalettedContainer.maybeHas`
+    /// (`/root/Vanilla/src/net/minecraft/world/level/chunk/PalettedContainer.java:298-300`)：
+    /// 只测调色板里出现过的状态，不遍历 4096 个格子。
+    ///
+    /// 「maybe」是因为调色板可能残留已经没有实例的状态，所以返回 `true` 只说明
+    /// 值得进一步扫描；返回 `false` 则一定没有。原版
+    /// `PoiManager.mayHavePoi` (`PoiManager.java:206-208`) 正是靠它跳过绝大多数
+    /// 不含 POI 的 section。
+    #[must_use]
+    pub fn maybe_has(&self, mut predicate: impl FnMut(BlockStateId) -> bool) -> bool {
+        match self {
+            Self::Homogeneous(id) => predicate(*id),
+            Self::Heterogeneous(data) => data.palette.iter().copied().any(predicate),
+        }
+    }
+
     #[must_use]
     pub fn random_ticking_counts(&self) -> (u16, u16) {
         match self {
