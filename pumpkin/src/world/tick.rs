@@ -14,9 +14,19 @@ use pumpkin_world::chunk::ChunkHeightmapType::MotionBlocking;
 use rand::seq::SliceRandom;
 use rand::{RngExt, rng};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::Ordering::Relaxed;
 use tracing::{debug, error, info, warn};
+
+/// 内存普查的限流计数器：全局原子自增，不加锁。
+///
+/// 多个世界共用一个计数器，所以每次只有命中取模的那个世界会输出，
+/// 各维度轮流采样，日志量固定不会随世界数放大。
+static MEMORY_CENSUS_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// 600 tick ≈ 30 秒。足够看出「只涨不落」的趋势，又不会刷屏。
+const MEMORY_CENSUS_INTERVAL_TICKS: u64 = 600;
 
 impl World {
     #[expect(clippy::too_many_lines)]
@@ -238,11 +248,67 @@ impl World {
             );
         }
 
+        // 内存普查：按固定 tick 间隔输出各长生命周期容器的 len()，
+        // 用来验证「只涨不落」是否还在发生。能观测比猜着修可靠。
+        if pumpkin_config::development_mode()
+            && MEMORY_CENSUS_TICKS.fetch_add(1, Relaxed) % MEMORY_CENSUS_INTERVAL_TICKS == 0
+        {
+            self.log_memory_census();
+        }
+
         // Vanilla broadcasts only once mid-tick (in chunkSource.tick). Changes after
         // that (entity/player phase) wait until the next tick's broadcast. We flush
         // once more at tick end so player/entity-driven setBlock still syncs without
         // waiting a full extra 50ms — still one batch, not per-block.
         self.flush_block_updates().await;
+    }
+
+    /// 打印各长生命周期容器的 `len()`，用于定位「内存只涨不落」。
+    ///
+    /// 判读要点：
+    /// - `entities_by_uuid` 与 `entities_by_id` 必须相等。持续不等说明
+    ///   `EntityLookup` 两张表不同步，实体只被摘掉了一半，就是泄漏。
+    /// - 所有玩家下线后 `entities_*` 应当回落。只涨不落说明有实体没被回收。
+    /// - `loaded_chunks` / `chunk_watchers` 应当跟随在线玩家视野涨落。
+    ///
+    /// 所有锁一律 `try_lock`，抢不到就记 -1 跳过 —— 绝不为了打日志阻塞 tick。
+    fn log_memory_census(&self) {
+        let forced_chunks: i64 = self.forced_chunks.try_lock().map_or(-1, |c| c.len() as i64);
+        let pending_vibrations: i64 = self
+            .pending_vibrations
+            .try_lock()
+            .map_or(-1, |v| v.len() as i64);
+        let unsent_block_entity_updates: i64 = self
+            .unsent_block_entity_updates
+            .try_lock()
+            .map_or(-1, |s| s.len() as i64);
+        let unsent_block_changes: i64 = self
+            .unsent_block_changes
+            .try_lock()
+            .map_or(-1, |s| s.len() as i64);
+        let synced_block_events: i64 = self
+            .synced_block_event_queue
+            .try_lock()
+            .map_or(-1, |q| q.len() as i64);
+
+        info!(
+            dimension = self.dimension.minecraft_name,
+            entities_by_uuid = self.entities.len(),
+            entities_by_id = self.entities.id_index_len(),
+            players = self.players.load().len(),
+            block_entity_chunks = self.block_entities.len(),
+            loaded_chunks = self.level.loaded_chunk_count(),
+            loaded_entity_chunks = self.level.loaded_entity_chunk_count(),
+            chunk_watchers = self.level.chunk_watcher_count(),
+            chunks_with_scheduled_ticks = self.level.chunks_with_scheduled_ticks.len(),
+            active_chunks = self.active_chunks.load().len(),
+            forced_chunks = forced_chunks,
+            pending_vibrations = pending_vibrations,
+            unsent_block_changes = unsent_block_changes,
+            unsent_block_entity_updates = unsent_block_entity_updates,
+            synced_block_events = synced_block_events,
+            "memory census (development mode; -1 = lock busy, skipped)"
+        );
     }
 
     async fn tick_environment(&self) {

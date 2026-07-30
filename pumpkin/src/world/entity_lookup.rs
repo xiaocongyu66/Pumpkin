@@ -83,6 +83,14 @@ impl EntityLookup {
         self.by_uuid.is_empty()
     }
 
+    /// `by_id` 表的长度。正常情况下应当与 `len()`（`by_uuid` 表）相等。
+    /// 两者持续不等说明有实体只从其中一张表里被摘掉了，这本身就是泄漏信号，
+    /// 所以内存普查会把两个数一起打出来对照。
+    #[must_use]
+    pub fn id_index_len(&self) -> usize {
+        self.by_id.len()
+    }
+
     /// Snapshot for tick / full iteration (vanilla `getAllEntities` / tick list).
     #[must_use]
     pub fn snapshot(&self) -> EntitySnapshot {

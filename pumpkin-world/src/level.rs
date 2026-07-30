@@ -452,6 +452,19 @@ impl Level {
         self.loaded_chunks.len()
     }
 
+    /// 已加载的实体区块数量，供内存普查对照 `loaded_chunk_count`。
+    #[must_use]
+    pub fn loaded_entity_chunk_count(&self) -> usize {
+        self.loaded_entity_chunks.len()
+    }
+
+    /// 仍有观察者的区块数量。它应当跟随玩家视野涨落；若与在线人数
+    /// 明显脱节且持续上涨，说明 watcher 计数没有正确归零。
+    #[must_use]
+    pub fn chunk_watcher_count(&self) -> usize {
+        self.chunk_watchers.len()
+    }
+
     pub fn list_cached(&self) {
         for entry in self.loaded_chunks.iter() {
             debug!("In map: {:?}", entry.key());
