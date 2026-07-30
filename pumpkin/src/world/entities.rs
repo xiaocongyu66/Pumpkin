@@ -9,8 +9,7 @@ use pumpkin_protocol::codec::var_long::VarLong;
 use pumpkin_protocol::java::client::play::CRemoveEntities;
 use pumpkin_util::Difficulty;
 use pumpkin_util::math::{
-    boundingbox::BoundingBox, get_section_cord, position::BlockPos, vector2::Vector2,
-    vector3::Vector3,
+    boundingbox::BoundingBox, position::BlockPos, vector2::Vector2, vector3::Vector3,
 };
 use pumpkin_util::random::{RandomImpl, get_seed, xoroshiro128::Xoroshiro};
 use pumpkin_world::chunk::io::Dirtiable;
@@ -21,24 +20,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
 
-/// 实体当前真正所在的区块坐标（由实时 `pos` 推导）。
-///
-/// `Entity.chunk_pos` 只在 `Entity::set_pos` 里刷新（`entity/entity_movement.rs:44`），
-/// 而投掷物、矿车等会直接写 `pos` 绕过 `set_pos`
-/// （`entity/projectile/mod.rs:56`、`entity/projectile/arrow.rs:98`、
-/// `entity/projectile/trident.rs:67`、`entity/projectile/fishing_bobber.rs:37`、
-/// `entity/vehicle/minecart.rs:312`），它们的缓存值会永久停在出生区块上。
-///
-/// `world/tick.rs` 的实体 tick 判定早就改用实时坐标了；凡是按区块归属做判断的
-/// 地方都必须用同一套口径，否则快速移动的实体会被漏掉。
-fn live_chunk_pos(entity: &Entity) -> Vector2<i32> {
-    let pos = entity.pos.load();
-    Vector2::new(
-        get_section_cord(pos.x.floor() as i32),
-        get_section_cord(pos.z.floor() as i32),
-    )
-}
-
 impl World {
     /// Serializes a live entity into its current chunk's entity data. The live
     /// entity list is the source of truth while a chunk is loaded (its saved NBT
@@ -46,10 +27,7 @@ impl World {
     /// currently in; the chunk is rewritten from scratch every unload cycle, so
     /// there is nothing stale to deduplicate.
     pub(super) async fn save_entity(&self, entity: &Arc<dyn EntityBase>) {
-        // 同样用实时坐标：`block_pos` 和 `chunk_pos` 一样只在 `set_pos` 里刷新，
-        // 直接写 `pos` 的实体（投掷物 / 矿车）缓存值是旧的。若按缓存值落盘，
-        // 实体会被写进它早就离开的区块，重新加载时凭空传送回去。
-        let current_chunk = live_chunk_pos(entity.get_entity());
+        let current_chunk = entity.get_entity().block_pos.load().chunk_position();
         let mut nbt = NbtCompound::new();
         entity.write_nbt(&mut nbt).await;
         let chunk = self.level.get_entity_chunk(current_chunk).await;
@@ -269,10 +247,7 @@ impl World {
 
     pub fn broadcast_entity_spawn(&self, entity: &Arc<dyn EntityBase>) {
         let base_entity = entity.get_entity();
-        // 实时坐标：投掷物在构造后、spawn 前直接写 `pos`，缓存的 `chunk_pos`
-        // 还停在 `Entity::new` 时的初始值，按它筛选会把生成包发给错误的区块，
-        // 附近真正该看到箭 / 三叉戟的玩家反而收不到。
-        let chunk_pos = live_chunk_pos(base_entity);
+        let chunk_pos = base_entity.chunk_pos.load();
 
         let players = self.players.load();
         for player in players.iter() {
@@ -331,9 +306,7 @@ impl World {
             );
         }
 
-        // 同样用实时坐标，否则移除包会广播给旧区块的观察者，
-        // 真正看得见这个实体的玩家收不到，客户端上留下永久的幽灵实体。
-        let chunk_pos = live_chunk_pos(base_entity);
+        let chunk_pos = base_entity.chunk_pos.load();
         self.broadcast_to_chunk_editioned_sync(
             chunk_pos,
             &CRemoveEntities::new(&[base_entity.entity_id.into()]),
@@ -345,18 +318,16 @@ impl World {
         let chunks_set: FxHashSet<_> = chunks.iter().copied().collect();
         let entities_to_remove = self.entities.drain_if(|entity| {
             let base_entity = entity.get_entity();
-            // 用实时坐标判定归属，而不是缓存的 `chunk_pos`。
-            //
-            // 这是「内存只涨不落」的根因：`remove_entities_in_chunks` 是唯一
-            // 会把实体从 `EntityLookup` 批量摘掉的地方，原先按缓存的
-            // `chunk_pos` 匹配。但投掷物 / 矿车会直接写 `pos`，缓存值永久失效，
-            // 于是它们真正所在的区块卸载时匹配不上，永远留在 `EntityLookup` 里。
-            // 而 `Entity.world` 是强引用（`entity/mod.rs:720`），`EntityLookup`
-            // 又持有 `Arc<dyn EntityBase>`（`world/entity_lookup.rs:57-58`），
-            // 这些实体和它们引用到的一切（AI target、载具、玩家）就再也不会释放。
-            // 它们同时也永远不会再被 tick（实时区块不在 active_chunks 内，
-            // `world/tick.rs:99`），所以 `check_despawn` 也救不回来。
-            if chunks_set.contains(&live_chunk_pos(base_entity)) {
+            // 按 `chunk_pos` 匹配。这是唯一会把实体从 `EntityLookup` 批量摘掉的
+            // 地方，依赖「`chunk_pos` 永远和实时 `pos` 一致」这条不变量——该不变量
+            // 由 `Entity::set_pos` 维护，所有位置写入都必须走它（对齐原版
+            // `Entity.setPosRaw`，见 `entity/projectile/*`、`entity/vehicle/minecart.rs`）。
+            // 一旦有人绕过 `set_pos` 直接写 `pos`，那个实体的缓存值就会永久失效，
+            // 它真正所在的区块卸载时匹配不上，于是永远留在 `EntityLookup` 里；
+            // 又因为 `Entity.world` 是强引用（`entity/mod.rs:720`）而 `EntityLookup`
+            // 持有 `Arc<dyn EntityBase>`（`world/entity_lookup.rs:57-58`），
+            // 形成强引用环，实体连同它引用的一切（AI target、载具、玩家）都不再释放。
+            if chunks_set.contains(&base_entity.chunk_pos.load()) {
                 base_entity.mark_removed(crate::entity::RemovalReason::UnloadedToChunk);
                 true
             } else {

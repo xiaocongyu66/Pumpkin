@@ -64,7 +64,8 @@ impl TridentEntity {
     ) -> Self {
         let mut owner_pos = shooter.pos.load();
         owner_pos.y = owner_pos.y + f64::from(shooter.entity_dimension.load().eye_height) - 0.1;
-        entity.pos.store(owner_pos);
+        // 同上：三叉戟走 `AbstractArrow` 的构造路径，原版同样是 `this.setPos(x, y, z)`。
+        entity.set_pos(owner_pos);
         entity.set_velocity(Vector3::new(0.0, 0.1, 0.0));
 
         Self {
