@@ -392,6 +392,52 @@ pub trait Mob: EntityBase + Send + Sync {
 #[expect(dead_code)]
 const DEFAULT_PATHFINDING_FAVOR: f32 = 0.0;
 
+/// 抹掉这只 mob 的全部 AI 状态。
+///
+/// 对齐原版 `Mob.removeFreeWill()`（`Mob.java:1424-1427`：`removeAllGoals(goal -> true)`
+/// 加 `brain.removeAllBehaviors()`）。Pumpkin 没有 brain，两个 `GoalSelector` 加
+/// `MobEntity.target` 就是全部 AI 状态。
+///
+/// 这一步在 Rust 下是内存回收的必需动作：15 个 goal 字段（`ai/goal/revenge.rs` 的
+/// `target`、`ai/goal/follow_owner.rs` 的 `owner`、`ai/goal/breed.rs` 的 `mate` 等）和
+/// `MobEntity.target` 持的都是 `Arc<dyn EntityBase>`。实体被移除后不再 tick，
+/// `GoalSelector::tick` 里那条「`should_continue` 为假就 `stop()`」的正常收尾路径
+/// （`ai/goal/goal_selector.rs:95-103`，对齐 `GoalSelector.java:69-76` 的 `goalCleanup`）
+/// 永远不会再跑，这些 `Arc` 于是一个都释放不掉；两只互相把对方当目标的 mob 直接构成
+/// 强引用环，整张实体图连同它引用的世界一起永久留在内存里。原版靠 GC 处理这种环，
+/// Rust 必须显式断开。
+pub async fn remove_free_will(mob: &dyn Mob) {
+    let mob_entity = mob.get_mob_entity();
+
+    // 与 tick 相同的「取出 → 锁外 await → 放回」模式（`mob/entity_base.rs:97-120`）：
+    // `GoalSelector` 在 std `Mutex` 里，而 `Goal::stop` 是 async，guard 不能跨 await。
+    // 取出后放回的就是清空后的同一个 selector，等价于放回 `GoalSelector::default()`。
+    let mut target_selector = {
+        let mut guard = mob_entity.target_selector.lock().unwrap();
+        std::mem::take(&mut *guard)
+    };
+    let mut goals_selector = {
+        let mut guard = mob_entity.goals_selector.lock().unwrap();
+        std::mem::take(&mut *guard)
+    };
+
+    target_selector.clear_all_goals(mob).await;
+    goals_selector.clear_all_goals(mob).await;
+
+    {
+        *mob_entity.target_selector.lock().unwrap() = target_selector;
+        *mob_entity.goals_selector.lock().unwrap() = goals_selector;
+    };
+
+    // 兜底清空 target，等价于原版 `Mob.setTarget(null)`（`Mob.java:295-297`）。
+    // 上面清空 selector 时，正在运行的 target goal 的 `stop()` 已经顺带清过一次
+    // （`ai/goal/track_target.rs:192-196`，对齐 `TargetGoal.java:87-90`）；但 target
+    // 也可能是被 `LivingEntity` 的受击/复仇路径直接写进去的，那时没有任何 goal 在跑，
+    // 只能在这里断。必须放在 selector 清空之后：`stop()` 内部会再锁一次
+    // `MobEntity.target`，提前拿着那把 tokio `Mutex` 的 guard 就是死锁。
+    mob.set_mob_target(None).await;
+}
+
 pub trait PathAwareEntity: Mob + Send + Sync {
     fn get_pathfinding_favor(&self, _block_pos: BlockPos, _world: Arc<World>) -> f32 {
         0.0

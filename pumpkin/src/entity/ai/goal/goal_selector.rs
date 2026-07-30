@@ -51,6 +51,22 @@ impl GoalSelector {
         }
     }
 
+    /// 对齐原版 `GoalSelector.removeAllGoals(goal -> true)`（`GoalSelector.java:42-49`）：
+    /// 先对仍在运行的 goal 调一遍 `stop()`，再把它们整体丢弃。
+    ///
+    /// `stop()` 是原版留给 goal 的唯一收尾回调（`ai/goal/target/TargetGoal.java:87-90`
+    /// 在那里把 `mob.setTarget(null)` 和自己缓存的 `targetMob` 一起清掉），所以清空前
+    /// 必须走一遍，否则 goal 里缓存的实体 `Arc` 只会随对象一起被静默泄漏。
+    pub async fn clear_all_goals(&mut self, mob: &dyn Mob) {
+        for prioritized_goal in &mut self.goals {
+            if prioritized_goal.running {
+                prioritized_goal.stop(mob).await;
+            }
+        }
+        self.goals.clear();
+        self.goals_by_control = [usize::MAX; 4];
+    }
+
     fn uses_any(prioritized_goal: &PrioritizedGoal, controls: Controls) -> bool {
         let goal_controls = prioritized_goal.controls();
         for control in Controls::ITER {

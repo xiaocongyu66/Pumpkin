@@ -114,6 +114,21 @@ impl<T: Mob + Send + 'static> EntityBase for T {
             }
 
             // 3. "Put back" selectors
+            //
+            // 放回前先复查移除状态：goal 自己就可能在上一步里把宿主移除掉（全仓唯一的
+            // 例子是 `ai/goal/silverfish_merge.rs:104` 的 `entity.remove().await`，钻进
+            // 石头时把自己删掉）。那条路径进到 `World::remove_entity` 时，两个 selector
+            // 已经被上面 take 走、锁里只剩 `GoalSelector::default()`，那边的
+            // `remove_free_will` 清到的是空壳；真正持有 `Arc<dyn EntityBase>` 的 goal 还在
+            // 这两个局部变量里，原样放回就等于把强引用重新挂回实体上，之后再没有 tick
+            // 会来收尾。所以这里补一遍对齐 `Mob.removeFreeWill()`（`Mob.java:1424-1427`）
+            // 的清理，放回的就是空 selector。
+            if mob_entity.living_entity.entity.is_removed() {
+                target_selector.clear_all_goals(self).await;
+                goals_selector.clear_all_goals(self).await;
+                self.set_mob_target(None).await;
+            }
+
             {
                 *mob_entity.target_selector.lock().unwrap() = target_selector;
                 *mob_entity.goals_selector.lock().unwrap() = goals_selector;
@@ -243,6 +258,11 @@ impl<T: Mob + Send + 'static> EntityBase for T {
 
     fn cast_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// 一处覆写覆盖全部 mob，供 `World::remove_entity` 在移除时清理 AI 状态。
+    fn get_mob(&self) -> Option<&dyn Mob> {
+        Some(self)
     }
 
     fn is_in_love(&self) -> bool {
