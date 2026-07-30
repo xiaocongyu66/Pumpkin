@@ -274,7 +274,6 @@ impl World {
         self.spawn_state.load().add_entity(self, entity.as_ref());
     }
 
-    #[allow(clippy::unused_async)]
     pub async fn remove_entity(&self, entity: &dyn EntityBase) {
         // Sever mount links so vehicle/passenger Arc pairs (chicken jockeys,
         // ridden mobs) can actually drop instead of keeping each other alive.
@@ -293,6 +292,45 @@ impl World {
         // Ensure concurrent tick/damage paths see the entity as gone even if
         // callers forgot to call `Entity::mark_removed` first.
         base_entity.mark_removed(crate::entity::RemovalReason::Discarded);
+
+        // 断开拴绳。对齐原版 `Leashable.tickLeash` 里「实体不再可交互就解链」那条分支
+        // （`Leashable.java:161-166`：`!entity.canInteractWithLevel()` 时按 `ENTITY_DROPS`
+        // gamerule 走 `dropLeash()` 或 `removeLeash()`；`canInteractWithLevel` 见
+        // `Entity.java:389-391`，被移除的实体必然为假）。原版靠被拴实体自己每 tick
+        // 复查来触发，Pumpkin 的实体一离开 `EntityLookup` 就不再 tick，`tick_leash`
+        // 永远不会再跑，被拴这一头持有的 holder `Arc<dyn EntityBase>` 也就永远断不掉。
+        //
+        // Pumpkin 没有 `ENTITY_DROPS` gamerule，改用 `RemovalReason::should_destroy()`
+        // 近似：死亡/丢弃掉拴绳，卸载/换维度只解链——后者与原版
+        // `Entity.removeAfterChangingDimensions`（`Entity.java:3034-3040`，那里同样只调
+        // `removeLeash()`）一致。
+        if base_entity
+            .removal_reason
+            .load()
+            .is_some_and(|reason| reason.should_destroy())
+        {
+            base_entity.drop_leash().await;
+        } else {
+            base_entity.unleash().await;
+        }
+
+        // 抹掉 AI 状态。`MobEntity.target` 和 15 个 goal 字段持的都是
+        // `Arc<dyn EntityBase>`，两只互相锁定的 mob 就是一个谁也释放不掉的强引用环。
+        // 对齐原版 `Mob.removeFreeWill()`（`Mob.java:1424-1427`），细节见
+        // `entity/mob/mod.rs` 里 `remove_free_will` 的注释。
+        //
+        // mob 视图必须从注册表里那份 `Arc` 上取，不能直接用参数 `entity`：
+        // `Entity::remove`（`entity/mod.rs:2616`）传进来的是 `&Entity`，而
+        // `impl EntityBase for Entity` 没有覆写 `get_mob`（只有 `mob/entity_base.rs:13`
+        // 的 blanket impl 覆写了），于是自动消散（`mob/despawn.rs:61`）、蠹虫钻石头
+        // （`ai/goal/silverfish_merge.rs:104`）这些走 `Entity::remove` 的路径在参数上只
+        // 能拿到 `None`。注册表里存的是具体 mob 类型的 `Arc`，两种调用形态都能命中。
+        let registered = self.entities.get_by_uuid(base_entity.entity_uuid);
+        let mob_source = registered.as_deref().unwrap_or(entity);
+        if let Some(mob) = mob_source.get_mob() {
+            crate::entity::mob::remove_free_will(mob).await;
+        }
+
         // O(1) remove — only adjust spawn caps if the entity was actually present
         // (prevents double-remove under-counting mob caps).
         if self.entities.remove(entity).is_some() {
@@ -338,6 +376,21 @@ impl World {
         for entity in entities_to_remove {
             self.save_entity(&entity).await;
             self.spawn_state.load().remove_entity(self, entity.as_ref());
+
+            // 区块卸载同样要断掉强引用。原版这条路径走的是 `setRemoved(UNLOADED_TO_CHUNK)`
+            // 而不是 `remove()`（`PersistentEntitySectionManager.java:241`），所以原版
+            // 在这里既不清 brain 记忆也不解链——它不需要：实体对象整体交给 GC，环会被
+            // 一起回收，拴绳则由 NBT 里的 `LeashData` 在重新加载时恢复。
+            //
+            // Pumpkin 两点都不成立：`Arc` 环不会被回收，而拴绳压根不写 NBT，重新加载
+            // 后本就不存在。所以这里必须显式断开，且必须放在 `save_entity` 之后——
+            // AI 状态和拴绳都不参与序列化，清理不改变落盘内容，但顺序上先存后清最稳。
+            // 只解链、不掉拴绳物品：`UnloadedToChunk` 的 `should_destroy()` 为假，对齐
+            // 原版 `Leashable.java:165` 在 `ENTITY_DROPS` 关闭时选 `removeLeash()`。
+            entity.get_entity().unleash().await;
+            if let Some(mob) = entity.get_mob() {
+                crate::entity::mob::remove_free_will(mob).await;
+            }
         }
 
         for chunk_pos in &chunks_set {

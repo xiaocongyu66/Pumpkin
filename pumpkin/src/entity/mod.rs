@@ -612,6 +612,20 @@ pub trait EntityBase: Send + Sync + NBTStorage + std::any::Any {
         None
     }
 
+    /// 取得这只实体的 mob 视图，非 mob 实体返回 `None`。
+    ///
+    /// 只在 `mob/entity_base.rs` 的 blanket impl（`impl<T: Mob> EntityBase for T`）里
+    /// 覆写一次，就覆盖全部 mob 实现；`world/entities.rs` 拿到的是 `&dyn EntityBase`，
+    /// 靠它才能在移除时进到 AI 状态里去断引用。
+    ///
+    /// 返回的是 `&dyn Mob` 而不是 `&MobEntity`：`MobEntity` 只是状态结构体、自己并不
+    /// 实现 `Mob`，而收尾要调的 `Goal::stop` 签名是 `stop(&dyn Mob)`
+    /// （`ai/goal/mod.rs:89-91`），必须有 trait object 才能调；`MobEntity` 可以再由
+    /// `Mob::get_mob_entity` 取到。
+    fn get_mob(&self) -> Option<&dyn crate::entity::mob::Mob> {
+        None
+    }
+
     /// Should return the name of the entity without click or hover events.
     fn get_name(&self) -> TextComponent {
         let entity = self.get_entity();
@@ -3160,9 +3174,39 @@ impl Entity {
     }
 
     pub async fn unleash(&self) {
+        self.drop_leash_inner(false).await;
+    }
+
+    /// 对齐原版 `Leashable.dropLeash()`（`Leashable.java:122-124` → 静态
+    /// `dropLeash(entity, sendPacket = true, dropLead = true)`，`Leashable.java:133-150`）：
+    /// 解链、广播解链包，并在世界里生成一个拴绳物品实体。
+    ///
+    /// 与 `unleash`（等价于 `Leashable.removeLeash()`，`Leashable.java:126-128`，
+    /// `dropLead = false`）的唯一区别就是掉不掉这根拴绳。原版靠
+    /// `Leashable.java:161-166` 按 `ENTITY_DROPS` gamerule 二选一，Pumpkin 暂无该
+    /// gamerule，改由调用方按 `RemovalReason` 决定。
+    pub async fn drop_leash(&self) {
+        self.drop_leash_inner(true).await;
+    }
+
+    /// `unleash` / `drop_leash` 的共同实现，对齐原版私有静态
+    /// `Leashable.dropLeash(E, boolean sendPacket, boolean dropLead)`
+    /// （`Leashable.java:133-150`）。原版 `sendPacket` 只有
+    /// `setDelayedLeashHolderId`（:84）那一条读档路径会传 false，Pumpkin 没有拴绳
+    /// 存档，所以这里固定广播。
+    async fn drop_leash_inner(&self, drop_lead: bool) {
+        // 对齐 `Leashable.java:134-135`：leashData 为空就整段跳过，掉落也一并跳过。
         let old_holder = self.leashed_to.lock().await.take();
         if old_holder.is_none() {
             return;
+        }
+
+        // 对齐 `Leashable.java:141-143`：先掉物品，再广播解链包。
+        if drop_lead {
+            let lead_item =
+                pumpkin_data::item_stack::ItemStack::new(1, &pumpkin_data::item::Item::LEAD);
+            let world = self.world.load_full();
+            world.drop_stack(&self.block_pos.load(), lead_item).await;
         }
 
         let je_packet =
@@ -3920,6 +3964,7 @@ mod split_reachability {
     // entity_riding.rs
     const _: () = probe(Entity::add_passenger);
     const _: () = probe(Entity::unleash);
+    const _: () = probe(Entity::drop_leash);
 
     // entity_state.rs
     const _: fn(&Entity) -> HorizontalFacing = Entity::get_horizontal_facing;
