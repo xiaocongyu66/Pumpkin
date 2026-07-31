@@ -264,11 +264,11 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &mut PermissionReg
     ));
 
     dispatcher.register(
-        command("locate", DESCRIPTION).requires(PERMISSION).then(
-            literal("structure").then(
+        command("locate", DESCRIPTION)
+            .requires(PERMISSION)
+            .then(literal("structure").then(
                 argument(ARG_STRUCTURE, StructureArgumentType).executes(LocateStructureExecutor),
-            ),
-        ),
+            )),
     );
 }
 
