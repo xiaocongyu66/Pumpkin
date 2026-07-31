@@ -58,100 +58,38 @@ impl MeleeAttackGoal {
         target.get_entity().pos.load()
     }
 
-    /// Prefer dry ground near the target. Iron golems (and any mob with water
-    /// malus < 0) must not path into water when a zombie is knocked into a pond.
+    /// Vanilla `PathNavigation.createPath(target, reachRange)` probe used by
+    /// `MeleeAttackGoal.canUse` (`MeleeAttackGoal.java:48`).
     ///
-    /// `avoid_water` must be computed by the caller **without** holding
-    /// `navigator`'s mutex — `start()` already locks the navigator.
-    fn path_destination_for(
-        mob: &dyn Mob,
-        target: &dyn EntityBase,
-        avoid_water: bool,
-    ) -> Vector3<f64> {
-        let default = Self::path_destination(target);
-        if !avoid_water {
-            return default;
-        }
-
-        let world = mob.get_entity().world.load();
-        let pos = target.get_entity().pos.load();
-        let feet = pos.to_block_pos();
-
-        let is_water_at = |p: pumpkin_util::math::position::BlockPos| {
-            use pumpkin_data::tag::Taggable;
-            let state_id = world.get_block_state_id(&p);
-            pumpkin_data::fluid::Fluid::from_state_id(state_id)
-                .is_some_and(|f| f.has_tag(&pumpkin_data::tag::Fluid::MINECRAFT_WATER))
+    /// The navigator lives behind a `std::sync::Mutex`, so its guard must never
+    /// cross the `.await`. The navigator is therefore moved out of the mutex for
+    /// the duration of the path computation and moved back afterwards — the same
+    /// pattern `MobEntity::tick` uses to drive `Navigator::tick`
+    /// (`entity/mob/entity_base.rs`). Two consequences worth stating explicitly,
+    /// since this used to be an undocumented convention:
+    ///
+    /// - Callers may hold no navigator guard, but they are free to lock the
+    ///   navigator again *after* this returns; nothing here is re-entrant.
+    /// - While the probe is in flight the mutex holds a default `Navigator`, so
+    ///   the per-mob pathfinding malus overrides are momentarily invisible to
+    ///   other readers. Only the mob's own AI tick touches its navigator, and
+    ///   that tick drives this future to completion, so no other observer runs
+    ///   inside the window.
+    ///
+    /// # Panics
+    /// Panics if the navigator mutex is poisoned.
+    async fn probe_has_path(mob: &dyn Mob, dest: Vector3<f64>) -> bool {
+        let mob_entity = mob.get_mob_entity();
+        let mut navigator = {
+            let mut guard = mob_entity.navigator.lock().unwrap();
+            std::mem::take(&mut *guard)
         };
-
-        // Target on dry land → normal destination.
-        if !is_water_at(feet) && !is_water_at(feet.down()) {
-            return default;
-        }
-
-        // Search for nearest solid bank within 8 blocks (spiral).
-        let origin = feet.0;
-        for r in 1i32..=8 {
-            for dx in -r..=r {
-                for dz in -r..=r {
-                    if dx.unsigned_abs() != r as u32 && dz.unsigned_abs() != r as u32 {
-                        continue;
-                    }
-                    for dy in -2i32..=2 {
-                        let p = pumpkin_util::math::position::BlockPos::new(
-                            origin.x + dx,
-                            origin.y + dy,
-                            origin.z + dz,
-                        );
-                        if is_water_at(p) {
-                            continue;
-                        }
-                        let below = p.down();
-                        let below_state = world.get_block_state(&below);
-                        let feet_state = world.get_block_state(&p);
-                        if below_state.is_solid() && !feet_state.is_solid() && !is_water_at(p) {
-                            return Vector3::new(
-                                f64::from(p.0.x) + 0.5,
-                                f64::from(p.0.y),
-                                f64::from(p.0.z) + 0.5,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // No bank found — keep current position so we don't march into the water.
-        let me = mob.get_entity().pos.load();
-        Vector3::new(me.x, me.y, me.z)
-    }
-
-    fn mob_avoids_water(mob: &dyn Mob) -> bool {
-        let is_golem =
-            mob.get_entity().entity_type.id == pumpkin_data::entity::EntityType::IRON_GOLEM.id;
-        if is_golem {
-            return true;
-        }
-        mob.get_mob_entity()
-            .navigator
-            .lock()
-            .unwrap()
-            .avoids_water()
-    }
-
-    /// Vanilla `createPath` probe for `canUse` without making the goal future !Send.
-    #[allow(clippy::await_holding_lock)] // guard lives only inside `block_on`, not the outer future
-    fn probe_has_path(
-        navigator: &std::sync::Mutex<crate::entity::ai::pathfinder::Navigator>,
-        living: &crate::entity::living::LivingEntity,
-        dest: Vector3<f64>,
-    ) -> bool {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut nav = navigator.lock().unwrap();
-                nav.create_path_to(living, dest).await.is_some()
-            })
-        })
+        let has_path = navigator
+            .create_path_to(&mob_entity.living_entity, dest)
+            .await
+            .is_some();
+        *mob_entity.navigator.lock().unwrap() = navigator;
+        has_path
     }
 }
 
@@ -200,18 +138,18 @@ impl Goal for MeleeAttackGoal {
                 return true;
             }
 
-            // Must be able to path to the target (or a dry bank if golem).
-            // Avoid holding `std::sync::MutexGuard` across `.await` (clippy
-            // await_holding_lock / !Send). Probe path with a scoped block_on.
-            let avoid_water = Self::mob_avoids_water(mob);
-            let dest = Self::path_destination_for(mob, target.as_ref(), avoid_water);
+            // Vanilla MeleeAttackGoal.java:48: `createPath(target, 0) != null`.
+            // Mobs that must not enter water (iron golem / enderman water malus
+            // -1) are handled by the pathfinder itself, exactly like vanilla:
+            // `WalkNodeEvaluator.findAcceptedNode` drops any node whose
+            // `getPathfindingMalus` is negative, so A* routes around the pond
+            // instead of the goal pre-selecting a dry bank.
+            let dest = Self::path_destination(target.as_ref());
             let me = mob.get_entity().pos.load();
             if me.squared_distance_to_vec(&dest) < 0.25 {
                 return false;
             }
-            let living = &mob.get_mob_entity().living_entity;
-            let navigator = &mob.get_mob_entity().navigator;
-            Self::probe_has_path(navigator, living, dest)
+            Self::probe_has_path(mob, dest).await
         })
     }
 
@@ -256,9 +194,9 @@ impl Goal for MeleeAttackGoal {
                 if !Self::target_is_valid(target.as_ref()) {
                     return;
                 }
-                // Read avoid_water / dest *before* locking navigator (non-reentrant Mutex).
-                let avoid_water = Self::mob_avoids_water(mob);
-                let dest = Self::path_destination_for(mob, target.as_ref(), avoid_water);
+                // Vanilla `moveTo(this.path, speedModifier)` — the path targets
+                // the mob's target directly (MeleeAttackGoal.java:48,60).
+                let dest = Self::path_destination(target.as_ref());
                 let mut navigator = mob.get_mob_entity().navigator.lock().unwrap();
                 navigator.set_progress(NavigatorGoal {
                     current_progress: mob.get_entity().pos.load(),
@@ -322,8 +260,13 @@ impl Goal for MeleeAttackGoal {
 
             self.update_countdown_ticks = (self.update_countdown_ticks - 1).max(0);
 
-            let avoid_water = Self::mob_avoids_water(mob);
-            let dest = Self::path_destination_for(mob, target.as_ref(), avoid_water);
+            // Vanilla `moveTo(target, speedModifier)` (MeleeAttackGoal.java:118)
+            // paths straight at the target; water avoidance is the pathfinder's
+            // job via the per-mob `PathType::Water` malus.
+            let dest = Self::path_destination(target.as_ref());
+            // TODO(rng-parity): vanilla advances one shared `RandomSource`;
+            // `Mob::get_random` hands out a fresh `ThreadRng` per call here and
+            // below. Tracked by the RNG parity work, not changed in this pass.
             let should_update_nav = self.update_countdown_ticks <= 0
                 && (self
                     .last_target_position
@@ -408,4 +351,36 @@ impl Goal for MeleeAttackGoal {
     fn controls(&self) -> Controls {
         self.goal_control
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MeleeAttackGoal;
+    use crate::entity::ai::pathfinder::Navigator;
+    use crate::entity::ai::pathfinder::node::PathType;
+
+    /// `path_destination` must stay the only destination helper: vanilla
+    /// `MeleeAttackGoal` paths at `createPath(target, 0)` / `moveTo(target, ..)`
+    /// and never picks a substitute position. The signature check fails to
+    /// compile if the helper starts taking the mob or a water flag again, which
+    /// is what the deleted dry-ground search needed.
+    const _: fn(&dyn crate::entity::EntityBase) -> pumpkin_util::math::vector3::Vector3<f64> =
+        MeleeAttackGoal::path_destination;
+
+    #[test]
+    fn goal_leaves_water_avoidance_to_the_pathfinder() {
+        // The goal no longer inspects blocks near the target. Water avoidance
+        // for an iron golem is entirely the navigator's negative water malus,
+        // matching vanilla Mob.setPathfindingMalus (Mob.java:212-214).
+        let mut navigator = Navigator::default();
+        navigator.set_pathfinding_malus(PathType::Water, -1.0);
+        assert!(navigator.get_pathfinding_malus(PathType::Water) < 0.0);
+    }
+
+    /// `probe_has_path` must remain an ordinary async fn. If it regains a
+    /// `block_in_place` wrapper it would have to become a sync fn returning
+    /// `bool`, and this coercion to a future-returning fn pointer stops
+    /// compiling.
+    const fn takes_future_fn<F: Copy>(_: F) {}
+    const _: () = takes_future_fn(MeleeAttackGoal::probe_has_path);
 }

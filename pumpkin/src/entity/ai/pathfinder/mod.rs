@@ -164,12 +164,31 @@ impl Navigator {
         self.path_type_overrides.insert(path_type, malus);
     }
 
-    /// True when water is marked impassable (malus < 0), e.g. iron golems.
+    /// Copies the per-mob overrides into the [`MobData`] handed to the node
+    /// evaluator for one search.
+    ///
+    /// Vanilla `Mob` sets no malus overrides in its constructor — the base
+    /// `getPathfindingMalus` falls through to `PathType.getMalus()`
+    /// (`Mob.java:167,204-210`). Per-mob overrides (zombies avoiding fire,
+    /// iron golems avoiding water) belong in the mob constructors via
+    /// [`Navigator::set_pathfinding_malus`], mirroring `setPathfindingMalus`
+    /// (`Mob.java:212-214`). This is the link that lets A* route a golem around
+    /// a pond, so `MeleeAttackGoal` can path straight at its target like vanilla.
+    pub(crate) fn apply_malus_overrides(&self, mob_data: &mut MobData) {
+        for (&path_type, &malus) in &self.path_type_overrides {
+            mob_data.set_pathfinding_malus(path_type, malus);
+        }
+    }
+
+    /// Read-only view of the per-mob malus overrides, mirroring vanilla
+    /// `Mob.getPathfindingMalus` (`Mob.java:204-210`): an unset type falls
+    /// through to `PathType.getMalus()`.
     #[must_use]
-    pub fn avoids_water(&self) -> bool {
+    pub fn get_pathfinding_malus(&self, path_type: PathType) -> f32 {
         self.path_type_overrides
-            .get(&PathType::Water)
-            .is_some_and(|&m| m < 0.0)
+            .get(&path_type)
+            .copied()
+            .unwrap_or_else(|| path_type.get_malus())
     }
 
     pub const fn set_mob_dimensions(&mut self, width: f32, height: f32) {
@@ -234,15 +253,7 @@ impl Navigator {
         mob_data.on_ground = entity.entity.on_ground.load(Ordering::Relaxed);
         mob_data.is_in_water = entity.entity.touching_water.load(Ordering::SeqCst);
 
-        // Vanilla `Mob` sets no malus overrides in its constructor — the base
-        // `getPathfindingMalus` falls through to `PathType.getMalus()`
-        // (Mob.java:167, 204-210). Per-mob overrides (e.g. zombies avoiding
-        // fire, golems avoiding water) belong in the mob constructors via
-        // `Navigator::set_pathfinding_malus`, mirroring `setPathfindingMalus`
-        // (Mob.java:212-214).
-        for (&path_type, &malus) in &self.path_type_overrides {
-            mob_data.set_pathfinding_malus(path_type, malus);
-        }
+        self.apply_malus_overrides(&mut mob_data);
 
         self.evaluator.prepare(context, mob_data);
 
@@ -729,5 +740,171 @@ impl Navigator {
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.is_idle.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod malus_tests {
+    use super::{Navigator, PathType};
+    use crate::entity::ai::pathfinder::node::Node;
+    use crate::entity::ai::pathfinder::node_evaluator::MobData;
+    use crate::entity::ai::pathfinder::walk_node_evaluator::WalkNodeEvaluator;
+    use pumpkin_util::math::vector3::Vector3;
+
+    fn mob_data() -> MobData {
+        MobData::new(Vector3::new(0.0, 64.0, 0.0), 1.4, 2.7, 1.0)
+    }
+
+    #[test]
+    fn unset_malus_falls_through_to_path_type_default() {
+        // Mob.java:204-210: no override -> PathType.getMalus().
+        let nav = Navigator::default();
+        assert!((nav.get_pathfinding_malus(PathType::Water) - 8.0).abs() < f32::EPSILON);
+        assert!(nav.get_pathfinding_malus(PathType::Walkable).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn overrides_reach_the_node_evaluator_mob_data() {
+        // The link MeleeAttackGoal relies on instead of searching for a dry
+        // bank: whatever a mob constructor sets must land in the MobData the
+        // evaluator consults for every candidate node.
+        let mut nav = Navigator::default();
+        nav.set_pathfinding_malus(PathType::Water, -1.0);
+        nav.set_pathfinding_malus(PathType::WaterBorder, -1.0);
+
+        let mut data = mob_data();
+        // Defaults before the copy: vanilla PathType table values.
+        assert!((data.get_pathfinding_malus(PathType::Water) - 8.0).abs() < f32::EPSILON);
+
+        nav.apply_malus_overrides(&mut data);
+
+        assert!((data.get_pathfinding_malus(PathType::Water) + 1.0).abs() < f32::EPSILON);
+        assert!((data.get_pathfinding_malus(PathType::WaterBorder) + 1.0).abs() < f32::EPSILON);
+        // Untouched types keep the vanilla table value.
+        assert!(data.get_pathfinding_malus(PathType::Walkable).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn negative_water_malus_makes_water_nodes_impassable() {
+        // WalkNodeEvaluator.java:220-222 keeps a node only while its mob penalty
+        // is >= 0, and isNeighborValid (WalkNodeEvaluator.java:149-151) refuses
+        // to expand into a negative-cost node from a passable one. Together
+        // these are what steer an iron golem around a pond.
+        let mut nav = Navigator::default();
+        nav.set_pathfinding_malus(PathType::Water, -1.0);
+        let mut data = mob_data();
+        nav.apply_malus_overrides(&mut data);
+
+        let water_penalty = data.get_pathfinding_malus(PathType::Water);
+        assert!(
+            water_penalty < 0.0,
+            "golem water malus must be negative, got {water_penalty}"
+        );
+
+        let dry_ground = Node {
+            cost_malus: data.get_pathfinding_malus(PathType::Walkable),
+            path_type: PathType::Walkable,
+            ..Node::default()
+        };
+        let water = Node {
+            cost_malus: water_penalty,
+            path_type: PathType::Water,
+            ..Node::default()
+        };
+        assert!(
+            !WalkNodeEvaluator::is_neighbor_valid(Some(&water), &dry_ground),
+            "water must not be expandable from dry ground for a water-avoiding mob"
+        );
+        assert!(
+            WalkNodeEvaluator::is_neighbor_valid(Some(&dry_ground), &dry_ground),
+            "dry ground stays walkable"
+        );
+    }
+
+    #[test]
+    fn take_and_restore_preserves_malus_overrides() {
+        // `MeleeAttackGoal::probe_has_path` moves the navigator out of its
+        // std::sync::Mutex so no guard crosses the .await, then moves it back.
+        // If that round trip dropped the overrides, a golem would silently
+        // become willing to swim after its first canUse probe.
+        let mut seeded = Navigator::default();
+        seeded.set_pathfinding_malus(PathType::Water, -1.0);
+        let mutex = std::sync::Mutex::new(seeded);
+
+        let taken = {
+            let mut guard = mutex.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        // The mutex now holds a default navigator; the overrides moved with the
+        // value rather than being lost.
+        let taken_malus = taken.get_pathfinding_malus(PathType::Water);
+        assert!(
+            (taken_malus + 1.0).abs() < f32::EPSILON,
+            "moved-out navigator must retain its overrides, got {taken_malus}"
+        );
+        {
+            *mutex.lock().unwrap() = taken;
+        }
+
+        let restored_malus = {
+            let guard = mutex.lock().unwrap();
+            guard.get_pathfinding_malus(PathType::Water)
+        };
+        assert!(
+            (restored_malus + 1.0).abs() < f32::EPSILON,
+            "restored navigator must still avoid water, got {restored_malus}"
+        );
+    }
+
+    #[test]
+    fn probe_pattern_runs_on_current_thread_runtime() {
+        // Regression guard for the removed `block_in_place` + `block_on`: that
+        // pair panics on a current_thread runtime, so the melee goal implicitly
+        // required #[tokio::main]'s multi_thread default. The take/await/restore
+        // pattern that replaced it must work on either flavor.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current_thread runtime");
+        let mut seeded = Navigator::default();
+        seeded.set_pathfinding_malus(PathType::Water, -1.0);
+        let mutex = std::sync::Mutex::new(seeded);
+
+        let malus = runtime.block_on(async {
+            let navigator = {
+                let mut guard = mutex.lock().unwrap();
+                std::mem::take(&mut *guard)
+            };
+            // Stand in for the `create_path_to(..).await` the goal performs; the
+            // point is that an await happens with no guard alive.
+            tokio::task::yield_now().await;
+            let malus = navigator.get_pathfinding_malus(PathType::Water);
+            {
+                *mutex.lock().unwrap() = navigator;
+            }
+            malus
+        });
+
+        assert!((malus + 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn swimming_mobs_keep_water_passable() {
+        // Counterpart: drowned/fish set WATER to 0.0, so the same code path must
+        // still allow water. Guards against over-broad water blocking.
+        let mut nav = Navigator::default();
+        nav.set_pathfinding_malus(PathType::Water, 0.0);
+        let mut data = mob_data();
+        nav.apply_malus_overrides(&mut data);
+
+        let water = Node {
+            cost_malus: data.get_pathfinding_malus(PathType::Water),
+            path_type: PathType::Water,
+            ..Node::default()
+        };
+        assert!(water.cost_malus.abs() < f32::EPSILON);
+        assert!(WalkNodeEvaluator::is_neighbor_valid(
+            Some(&water),
+            &Node::default()
+        ));
     }
 }
