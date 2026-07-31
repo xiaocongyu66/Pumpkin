@@ -172,8 +172,12 @@ mod tests {
             &Block::LODESTONE,
             &Block::LIGHTNING_ROD,
         ];
+        // 区块宽度只有 BlockPalette::SIZE（16），方块数超过 16 时不能全铺在
+        // 同一行上，否则 relative_x 会越界触发 set_block 的 debug_assert。
+        // 按 16×16 平面折行摆放。
         for (i, block) in blocks.iter().enumerate() {
-            sections.set_block_absolute_y(i, 64, 0, block.default_state.id);
+            let (x, z) = (i % BlockPalette::SIZE, i / BlockPalette::SIZE);
+            sections.set_block_absolute_y(x, 64, z, block.default_state.id);
         }
 
         let found = scan_chunk(&sections, 0, 0);
