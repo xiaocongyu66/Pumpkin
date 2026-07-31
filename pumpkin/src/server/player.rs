@@ -10,7 +10,7 @@ use pumpkin_util::text::TextComponent;
 use rand::seq::IndexedRandom;
 use std::net::IpAddr;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{error, warn};
 
 impl Server {
     /// Adds a new player to the server.
@@ -46,24 +46,39 @@ impl Server {
     ) -> Option<(Arc<Player>, Arc<World>)> {
         let gamemode = self.defaultgamemode.lock().await.gamemode;
 
-        let (world, nbt) =
-            if let Ok(Some(data)) = self.player_data_storage.load_data(&profile.id).await {
-                if let Some(dimension_key) = data.get_string("Dimension") {
-                    if let Some(dimension) = Dimension::from_name(dimension_key) {
-                        let world = self.get_world_from_dimension(dimension);
-                        (world, Some(data))
-                    } else {
-                        warn!("Invalid dimension key in player data: {dimension_key}");
-                        let default_world = self
-                            .worlds
-                            .load()
-                            .first()
-                            .expect("Default world should exist")
-                            .clone();
-                        (default_world, Some(data))
-                    }
+        // 必须区分「没有存档」和「读取失败」：
+        // - Ok(None)  → 新玩家，用默认数据进服，正常流程。
+        // - Err(..)   → 存档存在但读不出来（.dat_old 也救不回来）。此时绝不能
+        //   发一个空白新号，否则周期保存会把空白数据写回同一个 .dat，导致原
+        //   存档永久丢失。直接拒绝登录，把文件原样留在磁盘上等人工恢复。
+        let loaded_data = match self.player_data_storage.load_data(&profile.id).await {
+            Ok(data) => data,
+            Err(e) => {
+                error!(
+                    "Refusing login for {} ({}): player data could not be read: {e}",
+                    profile.name, profile.id
+                );
+                client
+                    .kick(
+                        DisconnectReason::UnrecoverableError,
+                        TextComponent::text(format!(
+                            "Failed to load your player data: {e}\n\
+                             Your save file has been preserved. \
+                             Please contact a server administrator."
+                        )),
+                    )
+                    .await;
+                return None;
+            }
+        };
+
+        let (world, nbt) = if let Some(data) = loaded_data {
+            if let Some(dimension_key) = data.get_string("Dimension") {
+                if let Some(dimension) = Dimension::from_name(dimension_key) {
+                    let world = self.get_world_from_dimension(dimension);
+                    (world, Some(data))
                 } else {
-                    // Player data exists but doesn't have a "Dimension" key.
+                    warn!("Invalid dimension key in player data: {dimension_key}");
                     let default_world = self
                         .worlds
                         .load()
@@ -73,15 +88,25 @@ impl Server {
                     (default_world, Some(data))
                 }
             } else {
-                // No player data found or an error occurred, default to the Overworld.
+                // Player data exists but doesn't have a "Dimension" key.
                 let default_world = self
                     .worlds
                     .load()
                     .first()
                     .expect("Default world should exist")
                     .clone();
-                (default_world, None)
-            };
+                (default_world, Some(data))
+            }
+        } else {
+            // No player data found (new player), default to the Overworld.
+            let default_world = self
+                .worlds
+                .load()
+                .first()
+                .expect("Default world should exist")
+                .clone();
+            (default_world, None)
+        };
 
         let mut player = Player::new(
             client,
