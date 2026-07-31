@@ -3444,11 +3444,9 @@ impl Entity {
         if distance > Self::LEASH_SNAP_DISTANCE {
             // 原版 Leashable.java:168-170：超过 snap 距离先放 lead.break 音效，
             // 再走 leashTooFarBehaviour()（默认 dropLeash，Mob 覆写还会禁用 MOVE 控制）。
-            self.world.load().play_sound(
-                Sound::ItemLeadBreak,
-                SoundCategory::Neutral,
-                &holder_pos,
-            );
+            self.world
+                .load()
+                .play_sound(Sound::ItemLeadBreak, SoundCategory::Neutral, &holder_pos);
             dyn_self.leash_too_far_behaviour().await;
         } else if distance
             > Self::LEASH_ELASTIC_DISTANCE
