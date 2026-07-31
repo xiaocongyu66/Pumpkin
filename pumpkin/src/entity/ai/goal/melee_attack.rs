@@ -139,6 +139,17 @@ impl MeleeAttackGoal {
             .avoids_water()
     }
 
+    /// Vanilla `!PathNavigation.isDone()` (`PathNavigation.java:330-331`:
+    /// `path == null || path.isDone()`). Pumpkin's navigator tracks the same
+    /// state in `is_idle`, which it sets whenever the path completes, is dropped,
+    /// or fails to compute.
+    ///
+    /// # Panics
+    /// Panics if the navigator mutex is poisoned.
+    fn has_active_path(mob: &dyn Mob) -> bool {
+        !mob.get_mob_entity().navigator.lock().unwrap().is_idle()
+    }
+
     /// Vanilla `createPath` probe for `canUse` without making the goal future !Send.
     #[allow(clippy::await_holding_lock)] // guard lives only inside `block_on`, not the outer future
     fn probe_has_path(
@@ -236,13 +247,21 @@ impl Goal for MeleeAttackGoal {
                 return false;
             }
 
+            // Vanilla `MeleeAttackGoal.canContinueToUse` (MeleeAttackGoal.java:68-73).
+            // `pause_when_mob_idle` is vanilla's `followingTargetEvenIfNotSeen`
+            // (3rd constructor argument, MeleeAttackGoal.java:19/30-33).
             if self.pause_when_mob_idle {
                 return mob
                     .get_mob_entity()
                     .is_in_position_target_range_pos(&target.get_entity().block_pos.load());
             }
 
-            true
+            // `followingTargetEvenIfNotSeen == false` → `!navigation.isDone()`.
+            // Returning an unconditional `true` here kept zombies, endermen,
+            // spiders, creepers, skeletons and the warden holding MOVE|LOOK
+            // forever after a failed path, which starved their wander goals and
+            // froze them in place staring at the player.
+            Self::has_active_path(mob)
         })
     }
 

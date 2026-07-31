@@ -58,10 +58,24 @@ impl SlimeEntity {
             let mut goal_selector = mob_arc.entity.goals_selector.lock().unwrap();
             let mut target_selector = mob_arc.entity.target_selector.lock().unwrap();
 
-            goal_selector.add_goal(1, Box::new(SlimeFloatGoal::new(mob_arc.clone())));
-            goal_selector.add_goal(2, Box::new(SlimeAttackGoal::new(mob_arc.clone())));
-            goal_selector.add_goal(3, Box::new(SlimeRandomDirectionGoal::new(mob_arc.clone())));
-            goal_selector.add_goal(5, Box::new(SlimeKeepOnJumpingGoal::new(mob_arc.clone())));
+            // Weak handles: the goals live inside the slime's own goal selector,
+            // so strong `Arc`s here would form a cycle and leak every slime.
+            goal_selector.add_goal(
+                1,
+                Box::new(SlimeFloatGoal::new(Arc::downgrade(&mob_arc))),
+            );
+            goal_selector.add_goal(
+                2,
+                Box::new(SlimeAttackGoal::new(Arc::downgrade(&mob_arc))),
+            );
+            goal_selector.add_goal(
+                3,
+                Box::new(SlimeRandomDirectionGoal::new(Arc::downgrade(&mob_arc))),
+            );
+            goal_selector.add_goal(
+                5,
+                Box::new(SlimeKeepOnJumpingGoal::new(Arc::downgrade(&mob_arc))),
+            );
 
             target_selector.add_goal(
                 1,
@@ -472,11 +486,13 @@ impl MoveControlTrait for SlimeMoveControl {
 }
 
 pub struct SlimeFloatGoal {
-    slime: Arc<SlimeEntity>,
+    /// Weak: the slime owns this goal via its goal selector, so a strong handle
+    /// here would be a reference cycle that leaks the entity.
+    slime: Weak<SlimeEntity>,
 }
 
 impl SlimeFloatGoal {
-    pub const fn new(slime: Arc<SlimeEntity>) -> Self {
+    pub const fn new(slime: Weak<SlimeEntity>) -> Self {
         Self { slime }
     }
 }
@@ -484,7 +500,10 @@ impl SlimeFloatGoal {
 impl Goal for SlimeFloatGoal {
     fn can_start<'a>(&'a mut self, _mob: &'a dyn Mob) -> GoalFuture<'a, bool> {
         Box::pin(async move {
-            let entity = &self.slime.entity.living_entity.entity;
+            let Some(slime) = self.slime.upgrade() else {
+                return false;
+            };
+            let entity = &slime.entity.living_entity.entity;
             entity.touching_water.load(Ordering::Relaxed)
                 || entity.touching_lava.load(Ordering::Relaxed)
         })
@@ -492,14 +511,17 @@ impl Goal for SlimeFloatGoal {
 
     fn tick<'a>(&'a mut self, _mob: &'a dyn Mob) -> GoalFuture<'a, ()> {
         Box::pin(async move {
+            let Some(slime) = self.slime.upgrade() else {
+                return;
+            };
             if rand::random_range(0.0..1.0) < 0.8 {
-                self.slime
+                slime
                     .entity
                     .living_entity
                     .jumping
                     .store(true, Ordering::SeqCst);
             }
-            self.slime.speed_modifier.store(1.2);
+            slime.speed_modifier.store(1.2);
         })
     }
 
@@ -513,12 +535,13 @@ impl Goal for SlimeFloatGoal {
 }
 
 pub struct SlimeAttackGoal {
-    slime: Arc<SlimeEntity>,
+    /// Weak — see [`SlimeFloatGoal`].
+    slime: Weak<SlimeEntity>,
     grow_tired_timer: i32,
 }
 
 impl SlimeAttackGoal {
-    pub const fn new(slime: Arc<SlimeEntity>) -> Self {
+    pub const fn new(slime: Weak<SlimeEntity>) -> Self {
         Self {
             slime,
             grow_tired_timer: 0,
@@ -529,7 +552,10 @@ impl SlimeAttackGoal {
 impl Goal for SlimeAttackGoal {
     fn can_start<'a>(&'a mut self, _mob: &'a dyn Mob) -> GoalFuture<'a, bool> {
         Box::pin(async move {
-            let target = self.slime.entity.target.lock().await;
+            let Some(slime) = self.slime.upgrade() else {
+                return false;
+            };
+            let target = slime.entity.target.lock().await;
             target.is_some()
         })
     }
@@ -542,24 +568,30 @@ impl Goal for SlimeAttackGoal {
 
     fn should_continue<'a>(&'a self, _mob: &'a dyn Mob) -> GoalFuture<'a, bool> {
         Box::pin(async move {
-            let target = self.slime.entity.target.lock().await;
+            let Some(slime) = self.slime.upgrade() else {
+                return false;
+            };
+            let target = slime.entity.target.lock().await;
             target.is_some() && self.grow_tired_timer > 0
         })
     }
 
     fn tick<'a>(&'a mut self, _mob: &'a dyn Mob) -> GoalFuture<'a, ()> {
         Box::pin(async move {
+            let Some(slime) = self.slime.upgrade() else {
+                return;
+            };
             self.grow_tired_timer -= 1;
-            let target_guard = self.slime.entity.target.lock().await;
+            let target_guard = slime.entity.target.lock().await;
             if let Some(target) = target_guard.as_ref() {
                 let pos = target.get_entity().pos.load();
-                let my_pos = self.slime.entity.living_entity.entity.pos.load();
+                let my_pos = slime.entity.living_entity.entity.pos.load();
                 let dx = pos.x - my_pos.x;
                 let dz = pos.z - my_pos.z;
                 let yaw = dx.atan2(dz).to_degrees() as f32;
-                self.slime.target_yaw.store(yaw);
+                slime.target_yaw.store(yaw);
             }
-            self.slime.is_aggressive.store(true, Ordering::Relaxed);
+            slime.is_aggressive.store(true, Ordering::Relaxed);
         })
     }
 
@@ -573,13 +605,14 @@ impl Goal for SlimeAttackGoal {
 }
 
 pub struct SlimeRandomDirectionGoal {
-    slime: Arc<SlimeEntity>,
+    /// Weak — see [`SlimeFloatGoal`].
+    slime: Weak<SlimeEntity>,
     chosen_degrees: f32,
     next_randomize_time: i32,
 }
 
 impl SlimeRandomDirectionGoal {
-    pub const fn new(slime: Arc<SlimeEntity>) -> Self {
+    pub const fn new(slime: Weak<SlimeEntity>) -> Self {
         Self {
             slime,
             chosen_degrees: 0.0,
@@ -635,11 +668,12 @@ impl Goal for SlimeRandomDirectionGoal {
 }
 
 pub struct SlimeKeepOnJumpingGoal {
-    slime: Arc<SlimeEntity>,
+    /// Weak — see [`SlimeFloatGoal`].
+    slime: Weak<SlimeEntity>,
 }
 
 impl SlimeKeepOnJumpingGoal {
-    pub const fn new(slime: Arc<SlimeEntity>) -> Self {
+    pub const fn new(slime: Weak<SlimeEntity>) -> Self {
         Self { slime }
     }
 }
@@ -647,14 +681,19 @@ impl SlimeKeepOnJumpingGoal {
 impl Goal for SlimeKeepOnJumpingGoal {
     fn can_start<'a>(&'a mut self, _mob: &'a dyn Mob) -> GoalFuture<'a, bool> {
         Box::pin(async move {
-            let vehicle = self.slime.entity.living_entity.entity.vehicle.lock().await;
+            let Some(slime) = self.slime.upgrade() else {
+                return false;
+            };
+            let vehicle = slime.entity.living_entity.entity.vehicle.lock().await;
             vehicle.is_none()
         })
     }
 
     fn tick<'a>(&'a mut self, _mob: &'a dyn Mob) -> GoalFuture<'a, ()> {
         Box::pin(async move {
-            self.slime.speed_modifier.store(1.0);
+            if let Some(slime) = self.slime.upgrade() {
+                slime.speed_modifier.store(1.0);
+            }
         })
     }
 
