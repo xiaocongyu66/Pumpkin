@@ -250,7 +250,12 @@ mod tests {
         anger.tick(&always_valid);
         assert_eq!(anger.active_anger(Some(uuid)), 2);
         anger.tick(&always_valid);
-        // 降到 1 时原版直接移除，不再保留 0 值条目。
+        // 原版在衰减前判 `anger <= 1` 才移除（AngerManagement.java:106），
+        // 所以扣到 1 的条目还会多留一个 tick。
+        assert_eq!(anger.active_anger(Some(uuid)), 1);
+        assert_eq!(anger.top_suspect(&always_valid), Some(uuid));
+        anger.tick(&always_valid);
+        // 这一 tick 开头 anger == 1，直接出表，不留 0 值条目。
         assert_eq!(anger.active_anger(Some(uuid)), 0);
         assert!(anger.top_suspect(&always_valid).is_none());
     }
