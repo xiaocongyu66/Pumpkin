@@ -1,3 +1,8 @@
+//! `LivingEntity` 的装备槽、手持物与使用状态。
+//!
+//! 对应原版 `LivingEntity.setItemSlot` / `getArmorSlots` / `startUsingItem`
+//! (`/root/Vanilla/src/net/minecraft/world/entity/LivingEntity.java`)。
+
 use super::LivingEntity;
 use crate::entity::{Entity, EntityBase};
 use pumpkin_data::data_component_impl::{BlocksAttacksImpl, EquipmentSlot};

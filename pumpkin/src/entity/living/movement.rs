@@ -1,3 +1,8 @@
+//! `LivingEntity` 的移动、游泳、攀爬与坠落。
+//!
+//! 对应原版 `LivingEntity.travel` / `aiStep` / `causeFallDamage`
+//! (`/root/Vanilla/src/net/minecraft/world/entity/LivingEntity.java`)。
+
 use super::LivingEntity;
 use crate::block::OnLandedUponArgs;
 use crate::entity::EntityBase;

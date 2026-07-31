@@ -1,5 +1,9 @@
+//! `LivingEntity` 的生命值、吸收、属性与状态效果。
+//!
+//! 对应原版 `LivingEntity.heal` / `addEffect` / `tickEffects`
+//! (`/root/Vanilla/src/net/minecraft/world/entity/LivingEntity.java`)。
+
 use super::LivingEntity;
-use crate::entity::EntityBase;
 use crate::entity::attributes::{AttributeInstance, Modifier, ModifierOperation};
 use pumpkin_data::attributes::Attributes;
 use pumpkin_data::damage::DamageType;
@@ -429,6 +433,15 @@ impl LivingEntity {
     fn should_apply_effect_tick(effect: &pumpkin_data::potion::Effect, duration: i32) -> bool {
         let effect_type = effect.effect_type;
 
+        // 两个不祥/袭击之兆效果的节奏由 `omen` 模块统一给出，语义与
+        // `BadOmenMobEffect.shouldApplyEffectTickThisTick`（恒为 true）和
+        // `RaidOmenMobEffect.shouldApplyEffectTickThisTick`（仅剩余 1 tick）一致。
+        if let Some(should_tick) =
+            crate::world::raid::omen::should_apply_omen_tick(effect_type, duration)
+        {
+            return should_tick;
+        }
+
         if effect_type == &StatusEffect::REGENERATION {
             if duration <= 0 {
                 return false;
@@ -453,16 +466,6 @@ impl LivingEntity {
         } else if effect_type == &StatusEffect::SATURATION {
             // Saturation every tick
             true
-        } else if effect_type == &StatusEffect::BAD_OMEN {
-            // Vanilla `BadOmenMobEffect.shouldApplyEffectTickThisTick` returns
-            // `true` unconditionally
-            // (`/root/Vanilla/src/net/minecraft/world/effect/BadOmenMobEffect.java:23-25`).
-            true
-        } else if effect_type == &StatusEffect::RAID_OMEN {
-            // Vanilla `RaidOmenMobEffect.shouldApplyEffectTickThisTick`:
-            // `remainingDuration == 1`, i.e. only on the final tick
-            // (`/root/Vanilla/src/net/minecraft/world/effect/RaidOmenMobEffect.java:22-24`).
-            duration == 1
         } else {
             // Other effects that don't tick
             false
@@ -536,12 +539,13 @@ impl LivingEntity {
     /// Vanilla `BadOmenMobEffect.applyEffectTick`
     /// (`/root/Vanilla/src/net/minecraft/world/effect/BadOmenMobEffect.java:27-38`).
     ///
-    /// On success vanilla returns `false`, which ends the Bad Omen instance; that
-    /// removal is explicit here because Pumpkin's `tick_effects` ignores the return
-    /// value. [`convert_bad_omen`](crate::world::raid::omen::convert_bad_omen) both
-    /// applies Raid Omen and records the trigger position.
+    /// On success vanilla返回 `false`，由效果实例自身结束不祥之兆；这里显式移除，因为
+    /// Pumpkin 的 `tick_effects` 不消费返回值。
+    /// [`convert_bad_omen`](crate::world::raid::omen::convert_bad_omen) 同时负责施加
+    /// 袭击之兆并记录触发坐标。
     async fn tick_bad_omen(&self, amplifier: u8) {
         let world = self.entity.world.load();
+        // 原版这条分支只对 `ServerPlayer` 生效，用 UUID 反查玩家即等价于该 instanceof。
         let Some(player) = world.get_player_by_uuid(self.entity.entity_uuid) else {
             return;
         };
@@ -551,8 +555,8 @@ impl LivingEntity {
     }
 
     /// Vanilla `RaidOmenMobEffect.applyEffectTick`
-    /// (`/root/Vanilla/src/net/minecraft/world/effect/RaidOmenMobEffect.java:26-38`):
-    /// on the effect's final tick, start or extend the raid at the stored position.
+    /// (`/root/Vanilla/src/net/minecraft/world/effect/RaidOmenMobEffect.java:26-38`)：
+    /// 在效果的最后一 tick，于记录的坐标开启或延长袭击。
     async fn tick_raid_omen(&self) {
         let world = self.entity.world.load();
         let Some(player) = world.get_player_by_uuid(self.entity.entity_uuid) else {

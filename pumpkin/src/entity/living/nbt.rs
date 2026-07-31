@@ -1,3 +1,8 @@
+//! `LivingEntity` 的 NBT 读写。
+//!
+//! 对应原版 `LivingEntity.addAdditionalSaveData` / `readAdditionalSaveData`
+//! (`/root/Vanilla/src/net/minecraft/world/entity/LivingEntity.java`)。
+
 use super::LivingEntity;
 use crate::entity::{NBTStorage, NBTStorageInit, NbtFuture};
 use pumpkin_data::attributes::Attributes;
