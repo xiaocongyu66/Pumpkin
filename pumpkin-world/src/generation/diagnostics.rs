@@ -9,8 +9,8 @@
 //!
 //! The high-volume sites (chunk-edge biome fallback, and every reference-sweep
 //! site: [`structure_lazy_accepted`], [`structure_lazy_declined`],
-//! [`structure_reference_missing_start`]) are additionally rate limited via
-//! [`sampled`]: only the first hit and every Nth hit after it reach the log, so a
+//! [`structure_reference_missing_start`]) are additionally rate limited via the
+//! `sampled` helper: only the first hit and every Nth hit after it reach the log, so a
 //! busy generation pool cannot flood the console. Each of them carries its own
 //! running counter in the message, so the real volume stays readable.
 

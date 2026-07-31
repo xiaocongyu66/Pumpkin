@@ -76,7 +76,7 @@ pub struct VanillaGenerator {
     /// [`StructureSet::ALL`].
     ///
     /// Keyed by the original `StructureSet::ALL` index (not by a position in
-    /// [`Self::possible_structure_sets`]) so both stay valid independently.
+    /// [`field@Self::possible_structure_sets`]) so both stay valid independently.
     pub structure_allowed_biomes: FxHashMap<usize, Vec<u16>>,
     /// Indices into [`StructureSet::ALL`] of the sets that can actually place
     /// something in this dimension.
