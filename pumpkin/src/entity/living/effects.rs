@@ -4,7 +4,6 @@
 //! (`/root/Vanilla/src/net/minecraft/world/entity/LivingEntity.java`)。
 
 use super::LivingEntity;
-use crate::entity::EntityBase;
 use crate::entity::attributes::{AttributeInstance, Modifier, ModifierOperation};
 use pumpkin_data::attributes::Attributes;
 use pumpkin_data::damage::DamageType;
