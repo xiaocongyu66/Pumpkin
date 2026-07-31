@@ -28,6 +28,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering::Relaxed;
 
+use crossbeam::atomic::AtomicCell;
+
 use pumpkin_data::damage::DamageType;
 use pumpkin_data::effect::StatusEffect;
 use pumpkin_data::entity::{EntityPose, EntityType};
@@ -126,6 +128,12 @@ pub struct WardenEntity {
     /// `MemoryModuleType.SONIC_BOOM_COOLDOWN`。原版由 Brain 持有，这里放在实体上，
     /// 由 [`SonicBoomGoal`] 每次 `can_start` 时读取并递减。
     pub sonic_boom_cooldown: AtomicI32,
+    /// 世界边界快照（中心 X / 中心 Z / 直径），每 tick 由
+    /// [`Self::refresh_border_snapshot`] 刷新，供同步的 [`Self::is_within_border`] 读取。
+    /// 存快照而非每次取锁，是为了让 `can_target_entity` 等同步谓词无需 async 化。
+    border_center_x: AtomicCell<f64>,
+    border_center_z: AtomicCell<f64>,
+    border_diameter: AtomicCell<f64>,
     /// 原版 `Mob.ambientSoundTime`：环境音计时，见 [`Self::tick_ambient_sound`]。
     ambient_sound_time: AtomicI32,
 }
@@ -152,6 +160,11 @@ impl WardenEntity {
             touch_cooldown: AtomicI32::new(0),
             client_anger_level: AtomicI32::new(-1),
             sonic_boom_cooldown: AtomicI32::new(0),
+            // 初值对齐 `World::new` 里 `Worldborder::new(0.0, 0.0, 5.999_996_8E7, ..)`，
+            // 避免第一次 `refresh_border_snapshot` 之前边界判定把所有目标都判成越界。
+            border_center_x: AtomicCell::new(0.0),
+            border_center_z: AtomicCell::new(0.0),
+            border_diameter: AtomicCell::new(5.999_996_8E7),
             ambient_sound_time: AtomicI32::new(0),
         };
         let mob_arc = Arc::new(warden);
@@ -184,12 +197,34 @@ impl WardenEntity {
         mob_arc
     }
 
-    /// 原版 `getWorldBorder().isWithinBounds(...)`。单独抽出来是为了让
-    /// `std::sync::MutexGuard` 在这个同步函数里就地释放，不会跨越 await。
+    /// 原版 `getWorldBorder().isWithinBounds(...)`。
+    ///
+    /// `World::worldborder` 是 `tokio::sync::Mutex`，取它必须 `.await`；而本判定被
+    /// `can_target_entity` 等一批同步谓词（含 `is_some_and` 闭包）调用，若整条链
+    /// async 化会污染 8 个调用点且闭包无法直接 await。世界边界变化极缓慢（仅
+    /// `/worldborder` 指令与插值推进），所以改为每 tick 由 [`Self::refresh_border_snapshot`]
+    /// 刷新 `contains` 所需的三个标量，这里只读快照做同步判定。
     fn is_within_border(&self, pos: Vector3<f64>) -> bool {
+        let center_x = self.border_center_x.load();
+        let center_z = self.border_center_z.load();
+        let half = self.border_diameter.load() / 2.0;
+        // 与 `Worldborder::contains`（border.rs:104-111）保持一致的半开区间。
+        pos.x >= center_x - half
+            && pos.x < center_x + half
+            && pos.z >= center_z - half
+            && pos.z < center_z + half
+    }
+
+    /// 每 tick 刷新一次世界边界快照，供同步的 [`Self::is_within_border`] 使用。
+    async fn refresh_border_snapshot(&self) {
         let world = self.mob_entity.living_entity.entity.world.load();
-        let border = world.worldborder.lock().unwrap();
-        border.contains(pos.x, pos.z)
+        let (center_x, center_z, diameter) = {
+            let border = world.worldborder.lock().await;
+            (border.center_x, border.center_z, border.new_diameter)
+        };
+        self.border_center_x.store(center_x);
+        self.border_center_z.store(center_z);
+        self.border_diameter.store(diameter);
     }
 
     /// 原版 `Warden.canTargetEntity`（Warden.java:406-419）。
@@ -345,7 +380,7 @@ impl WardenEntity {
         let world = entity.world.load();
         let center = pos.to_centered_f64();
         let within_border = {
-            let border = world.worldborder.lock().unwrap();
+            let border = world.worldborder.lock().await;
             border.contains(center.x, center.z)
         };
         if !within_border {
@@ -591,6 +626,8 @@ impl Mob for WardenEntity {
             if !self.mob_entity.living_entity.is_alive() {
                 return;
             }
+            // 先刷新世界边界快照，之后的目标判定都读同步快照（见 is_within_border）。
+            self.refresh_border_snapshot().await;
             self.tick_cooldowns().await;
             self.tick_ambient_sound().await;
 
