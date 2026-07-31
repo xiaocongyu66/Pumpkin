@@ -61,7 +61,7 @@ pub struct RoarGoal {
 
 impl RoarGoal {
     #[must_use]
-    pub const fn new(warden: Weak<WardenEntity>) -> Box<Self> {
+    pub fn new(warden: Weak<WardenEntity>) -> Box<Self> {
         Box::new(Self {
             warden,
             ticks: 0,
@@ -184,7 +184,7 @@ pub struct InvestigateDisturbanceGoal {
 
 impl InvestigateDisturbanceGoal {
     #[must_use]
-    pub const fn new(warden: Weak<WardenEntity>) -> Box<Self> {
+    pub fn new(warden: Weak<WardenEntity>) -> Box<Self> {
         Box::new(Self { warden })
     }
 
@@ -283,7 +283,7 @@ pub struct SniffGoal {
 
 impl SniffGoal {
     #[must_use]
-    pub const fn new(warden: Weak<WardenEntity>) -> Box<Self> {
+    pub fn new(warden: Weak<WardenEntity>) -> Box<Self> {
         Box::new(Self {
             warden,
             ticks: 0,

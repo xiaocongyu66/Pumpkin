@@ -64,7 +64,7 @@ pub struct SonicBoomGoal {
 
 impl SonicBoomGoal {
     #[must_use]
-    pub const fn new(warden: Weak<WardenEntity>) -> Box<Self> {
+    pub fn new(warden: Weak<WardenEntity>) -> Box<Self> {
         Box::new(Self {
             warden,
             ticks: 0,
