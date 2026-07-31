@@ -1874,6 +1874,15 @@ impl LivingEntity {
     fn should_apply_effect_tick(effect: &pumpkin_data::potion::Effect, duration: i32) -> bool {
         let effect_type = effect.effect_type;
 
+        // 两个不祥/袭击之兆效果的节奏由 `omen` 模块统一给出，语义与
+        // `BadOmenMobEffect.shouldApplyEffectTickThisTick`（恒为 true）和
+        // `RaidOmenMobEffect.shouldApplyEffectTickThisTick`（仅剩余 1 tick）一致。
+        if let Some(should_tick) =
+            crate::world::raid::omen::should_apply_omen_tick(effect_type, duration)
+        {
+            return should_tick;
+        }
+
         if effect_type == &StatusEffect::REGENERATION {
             if duration <= 0 {
                 return false;
@@ -1961,6 +1970,41 @@ impl LivingEntity {
                 player.hunger_manager.add_hunger(hunger);
                 player.hunger_manager.add_saturation(hunger as f32 * 2.0);
             }
+        } else if effect_type == &StatusEffect::BAD_OMEN {
+            self.tick_bad_omen(amplifier).await;
+        } else if effect_type == &StatusEffect::RAID_OMEN {
+            self.tick_raid_omen().await;
+        }
+    }
+
+    /// Vanilla `BadOmenMobEffect.applyEffectTick`
+    /// (`/root/Vanilla/src/net/minecraft/world/effect/BadOmenMobEffect.java:27-38`).
+    ///
+    /// On success vanilla返回 `false`，由效果实例自身结束不祥之兆；这里显式移除，因为
+    /// Pumpkin 的 `tick_effects` 不消费返回值。
+    /// [`convert_bad_omen`](crate::world::raid::omen::convert_bad_omen) 同时负责施加
+    /// 袭击之兆并记录触发坐标。
+    async fn tick_bad_omen(&self, amplifier: u8) {
+        let world = self.entity.world.load();
+        // 原版这条分支只对 `ServerPlayer` 生效，用 UUID 反查玩家即等价于该 instanceof。
+        let Some(player) = world.get_player_by_uuid(self.entity.entity_uuid) else {
+            return;
+        };
+        if crate::world::raid::omen::convert_bad_omen(&world, &player, amplifier).await {
+            self.remove_effect(&StatusEffect::BAD_OMEN).await;
+        }
+    }
+
+    /// Vanilla `RaidOmenMobEffect.applyEffectTick`
+    /// (`/root/Vanilla/src/net/minecraft/world/effect/RaidOmenMobEffect.java:26-38`)：
+    /// 在效果的最后一 tick，于记录的坐标开启或延长袭击。
+    async fn tick_raid_omen(&self) {
+        let world = self.entity.world.load();
+        let Some(player) = world.get_player_by_uuid(self.entity.entity_uuid) else {
+            return;
+        };
+        if crate::world::raid::omen::trigger_raid_from_omen(&world, &player).await {
+            self.remove_effect(&StatusEffect::RAID_OMEN).await;
         }
     }
 

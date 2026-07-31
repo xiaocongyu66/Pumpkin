@@ -155,25 +155,33 @@ impl NBTStorage for VillagerEntity {
                 self.restocks_today.store(today, Ordering::Relaxed);
             }
 
-            if let (Some(x), Some(y), Some(z)) = (
+            let job_site = if let (Some(x), Some(y), Some(z)) = (
                 nbt.get_int("JobSiteX"),
                 nbt.get_int("JobSiteY"),
                 nbt.get_int("JobSiteZ"),
             ) {
-                *self.job_site.lock().unwrap() = Some(BlockPos::new(x, y, z));
+                Some(BlockPos::new(x, y, z))
             } else {
-                *self.job_site.lock().unwrap() = None;
-            }
+                None
+            };
+            *self.job_site.lock().unwrap() = job_site;
 
-            if let (Some(x), Some(y), Some(z)) = (
+            let home_pos = if let (Some(x), Some(y), Some(z)) = (
                 nbt.get_int("HomeX").or_else(|| nbt.get_int("BedX")),
                 nbt.get_int("HomeY").or_else(|| nbt.get_int("BedY")),
                 nbt.get_int("HomeZ").or_else(|| nbt.get_int("BedZ")),
             ) {
-                *self.home_pos.lock().unwrap() = Some(BlockPos::new(x, y, z));
+                Some(BlockPos::new(x, y, z))
             } else {
-                *self.home_pos.lock().unwrap() = None;
-            }
+                None
+            };
+            *self.home_pos.lock().unwrap() = home_pos;
+
+            // 位置读回来了，就意味着上次在世时那两张 POI 票据也在这个村民手上
+            // （票据随 `poi/` region 文件落盘，和这里的位置一起恢复）。必须同步恢复
+            // 持票标记，否则村民会去抢自己上次已经取走的票，抢不到就放弃绑定，那张
+            // 票再也没人归还。理由见 `villager/poi.rs` 模块文档。
+            self.restore_held_tickets(home_pos.is_some(), job_site.is_some());
 
             if let Some(offers_compound) = nbt.get_compound("Offers")
                 && let Some(recipes) = offers_compound.get_list("Recipes")

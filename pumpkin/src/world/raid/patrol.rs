@@ -122,7 +122,7 @@ impl PatrolSpawner {
 
         let player_pos = player.get_entity().block_pos.load();
         // PatrolSpawner.java:53-55 — never spawn a patrol on top of a village.
-        if village::is_close_to_village(world, &player_pos, PATROL_VILLAGE_SECTION_DISTANCE) {
+        if village::is_close_to_village(world, &player_pos, PATROL_VILLAGE_SECTION_DISTANCE).await {
             return;
         }
 

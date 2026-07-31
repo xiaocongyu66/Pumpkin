@@ -193,6 +193,11 @@ impl World {
 
         self.level.chunk_loading.lock().unwrap().send_change();
 
+        // 原版在区块读盘的同一个调用里逐 section 做 POI 一致性检查
+        // (`SerializableChunkData.java:190`)。Pumpkin 的区块加载是异步的，所以在
+        // 这里统一消化本 tick 新就绪的区块。
+        self.tick_poi_chunk_loads().await;
+
         if let Some(ref fight_mutex) = self.dragon_fight {
             dragon_fight::DragonFight::tick(fight_mutex, self).await;
         }

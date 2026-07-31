@@ -10,8 +10,10 @@ use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::math::vector3::Vector3;
 use serde::{Deserialize, Serialize};
 
+pub mod consistency;
 pub mod types;
 
+pub use consistency::{poi_type_for_state, scan_chunk};
 pub use types::PoiType;
 pub use types::max_tickets_of;
 
@@ -259,6 +261,40 @@ impl PoiRegion {
     #[must_use]
     pub fn get_all(&self) -> Vec<&PoiEntry> {
         self.entries.values().collect()
+    }
+
+    /// 区块级的一致性重建 —— 原版 `PoiManager.checkConsistencyWithBlocks`
+    /// (`PoiManager.java:193-204`) 对区块的每个 section 调一次
+    /// `PoiSection.refresh` (`PoiSection.java:144-152`)。section 是区块的划分，
+    /// 逐 section 重建与整块重建等价，这里合成一次遍历，免得每个 section 都把
+    /// 整个区域的记录扫一遍。
+    ///
+    /// `scanned` 是这一区块内当前成立的全部 POI。不在其中的旧记录会被摘掉；
+    /// 仍然成立的记录由 [`Self::add`] 原样留下（含票据），对应原版 refresh 复用
+    /// 旧 `PoiRecord` 的那一步 (`PoiSection.java:163-167`)。因为票据被保留，
+    /// 重复重建是幂等的，这正好补上 Pumpkin 读盘时丢掉 `Valid` 标记、无法像原版
+    /// 那样用 `isValid` 跳过重建的缺口。
+    pub fn rebuild_chunk(&mut self, chunk_x: i32, chunk_z: i32, scanned: &[PoiEntry]) -> bool {
+        let stale: Vec<(i32, i32, i32)> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|&(x, _, z)| (x >> 4, z >> 4) == (chunk_x, chunk_z))
+            .filter(|key| {
+                !scanned
+                    .iter()
+                    .any(|entry| (entry.x, entry.y, entry.z) == *key)
+            })
+            .collect();
+
+        let mut changed = false;
+        for (x, y, z) in stale {
+            changed |= self.remove(&BlockPos::new(x, y, z));
+        }
+        for entry in scanned {
+            changed |= self.add(entry.clone());
+        }
+        changed
     }
 
     #[must_use]
@@ -555,6 +591,18 @@ impl PoiStorage {
     /// Adds a nether-portal POI.
     pub fn add_portal(&mut self, pos: BlockPos) -> bool {
         self.add(pos, POI_TYPE_NETHER_PORTAL)
+    }
+
+    /// 用一次全区块扫描的结果替换该区块的 POI 记录。
+    ///
+    /// 对应原版 `PoiManager.checkConsistencyWithBlocks`
+    /// (`PoiManager.java:193-204`)：区块加载时按方块实况重建索引。
+    /// `scanned` 里已经存在且类型相同的记录会保留票据，见
+    /// [`PoiRegion::rebuild_chunk`]。
+    pub fn rebuild_chunk(&mut self, chunk_x: i32, chunk_z: i32, scanned: &[PoiEntry]) -> bool {
+        let (rx, rz) = (chunk_x >> 5, chunk_z >> 5);
+        self.get_or_load_region(rx, rz)
+            .rebuild_chunk(chunk_x, chunk_z, scanned)
     }
 
     /// Removes the POI record at `pos`, if any.
@@ -1221,6 +1269,50 @@ mod tests {
             ),
             Some(second)
         );
+    }
+
+    #[test]
+    fn rebuild_chunk_drops_stale_and_keeps_claimed_tickets() {
+        let kept = pos(1, 64, 1);
+        let gone = pos(2, 64, 2);
+        let added = pos(3, 64, 3);
+        // 另一区块的记录不该被这次重建碰到。
+        let other_chunk = pos(20, 64, 20);
+        let (_temp_dir, mut storage) = test_storage();
+        assert!(storage.add(kept, "minecraft:home"));
+        assert!(storage.add(gone, "minecraft:farmer"));
+        assert!(storage.add(other_chunk, "minecraft:farmer"));
+        assert!(storage.acquire(&kept));
+
+        let scanned = vec![
+            PoiEntry::new(kept, "minecraft:home"),
+            PoiEntry::new(added, "minecraft:meeting"),
+        ];
+        assert!(storage.rebuild_chunk(0, 0, &scanned));
+
+        // 仍然成立的床保留了已被占用的票据，没有被重建重置。
+        assert_eq!(storage.get(&kept).map(|entry| entry.free_tickets), Some(0));
+        // 方块已经不在了的记录被摘掉。
+        assert!(storage.get(&gone).is_none());
+        // 新扫到的方块进了索引。
+        assert_eq!(storage.get_type(&added), Some("minecraft:meeting"));
+        // 相邻区块不受影响。
+        assert_eq!(storage.get_type(&other_chunk), Some("minecraft:farmer"));
+
+        // 同样的扫描结果再来一次不应有任何变化（幂等）。
+        assert!(!storage.rebuild_chunk(0, 0, &scanned));
+        assert_eq!(storage.get(&kept).map(|entry| entry.free_tickets), Some(0));
+    }
+
+    #[test]
+    fn rebuild_chunk_with_no_blocks_clears_the_chunk() {
+        let stale = pos(1, 64, 1);
+        let (_temp_dir, mut storage) = test_storage();
+        assert!(storage.add(stale, "minecraft:home"));
+
+        assert!(storage.rebuild_chunk(0, 0, &[]));
+        assert!(storage.get(&stale).is_none());
+        assert!(!storage.rebuild_chunk(0, 0, &[]));
     }
 
     #[test]

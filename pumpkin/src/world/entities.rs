@@ -274,8 +274,27 @@ impl World {
         self.spawn_state.load().add_entity(self, entity.as_ref());
     }
 
-    #[allow(clippy::unused_async)]
     pub async fn remove_entity(&self, entity: &dyn EntityBase) {
+        // 原版 `Villager.releaseAllPois`（`Villager.java:557-561`）：村民离场时把
+        // 认领的床位/工作站票据还回去，否则那些 POI 会永久停在 `IS_OCCUPIED`，
+        // 别的村民再也认领不到（票据泄漏）。
+        //
+        // 原版挂在 `Villager.die`（`Villager.java:553`）和闪电转化女巫
+        // （`Villager.java:700`）两处；这里收口在唯一的移除入口上，死亡、被丢弃、
+        // 转化成僵尸村民/女巫都会经过，覆盖更全。
+        //
+        // 区块卸载走 `remove_entities_in_chunks`，不经过这里 —— 那是刻意的：
+        // 卸载时村民带着 `home_pos` 存盘，票据也留在 `poi/` region 文件里，两边
+        // 都不动才能在重新加载后继续成立。
+        if let Some(villager) = entity
+            .cast_any()
+            .downcast_ref::<crate::entity::passive::villager::VillagerEntity>()
+        {
+            // 必须在上任何 POI 锁之前做完：`release_all_pois` 自己会锁
+            // `portal_poi`，而那把 `tokio::sync::Mutex` 不可重入。
+            villager.release_all_pois().await;
+        }
+
         // Sever mount links so vehicle/passenger Arc pairs (chicken jockeys,
         // ridden mobs) can actually drop instead of keeping each other alive.
         {
