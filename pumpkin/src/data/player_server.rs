@@ -113,11 +113,20 @@ impl ServerPlayerData {
     pub async fn save_all_players(&self, server: &Server) -> Result<(), PlayerDataError> {
         let mut total_players = 0;
 
-        // Save players from all worlds
+        // Save players from all worlds.
+        // 单个玩家保存失败只记日志继续，不能中断整轮保存 —— 否则第一个出错的
+        // 玩家之后的所有人都不会被保存。对齐原版 PlayerList.saveAll 的裸循环 +
+        // PlayerDataStorage.save 内部 catch 掉异常的行为。
         for world in server.worlds.load().iter() {
             for player in world.players.load().iter() {
-                self.extract_data_and_save_player(player).await?;
-                total_players += 1;
+                if let Err(e) = self.extract_data_and_save_player(player).await {
+                    error!(
+                        "Failed to save player data for {}: {e}",
+                        player.gameprofile.id,
+                    );
+                } else {
+                    total_players += 1;
+                }
             }
         }
 
@@ -136,7 +145,8 @@ impl ServerPlayerData {
     ///
     /// # Returns
     ///
-    /// A Result indicating success or the error that occurred.
+    /// `Ok(None)` 表示这是新玩家（没有存档），`Err` 表示存档存在但读不出来。
+    /// 调用方**必须**区分这两者：把读取失败当成新玩家会让空白数据覆盖掉原存档。
     pub async fn load_data(
         &self,
         uuid: &uuid::Uuid,
@@ -147,26 +157,11 @@ impl ServerPlayerData {
             .await
             .expect("Player data load panicked");
 
-        match result {
-            Ok((should_load, data)) => {
-                if !should_load {
-                    // No data to load, continue with default data
-                    return Ok(None);
-                }
-                Ok(Some(data))
-            }
-            Err(e) => {
-                if self.storage.is_save_enabled() {
-                    // Only log as error if player data saving is enabled
-                    error!("Error loading player data for {uuid}: {e}");
-                } else {
-                    // Otherwise just log as info since it's expected
-                    debug!("Not loading player data for {uuid} (saving disabled)");
-                }
-                // Continue with default data even if there's an error
-                Ok(None)
-            }
-        }
+        // 存档存在却读不出来（且 .dat_old 也救不回来）时向上传播错误。
+        // 这里绝不能返回 Ok(None)，否则玩家会带默认数据进服并覆盖原文件。
+        result.inspect_err(|e| {
+            error!("Error loading player data for {uuid}: {e}");
+        })
     }
 
     /// Extracts and saves data from a player.
@@ -254,9 +249,8 @@ mod test {
         storage.save_player_data(&uuid, nbt).unwrap();
 
         // Load the data
-        let (load_success, loaded_nbt) = storage.load_player_data(&uuid).unwrap();
+        let loaded_nbt = storage.load_player_data(&uuid).unwrap().unwrap();
 
-        assert!(load_success);
         assert_eq!(loaded_nbt.get_string("TestKey").unwrap(), "TestValue");
         assert_eq!(loaded_nbt.get_int("TestInt").unwrap(), 42);
     }
@@ -271,10 +265,7 @@ mod test {
         let uuid = Uuid::new_v4();
 
         // Try to load non-existent data
-        let (load_success, empty_nbt) = storage.load_player_data(&uuid).unwrap();
-
-        assert!(!load_success);
-        assert_eq!(empty_nbt.child_tags.len(), 0);
+        assert!(storage.load_player_data(&uuid).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -292,10 +283,8 @@ mod test {
         let save_result = storage.save_player_data(&uuid, nbt);
         assert!(save_result.is_ok());
 
-        // Load should return empty data
-        let (load_success, empty_nbt) = storage.load_player_data(&uuid).unwrap();
-        assert!(!load_success);
-        assert_eq!(empty_nbt.child_tags.len(), 0);
+        // Load should report no data
+        assert!(storage.load_player_data(&uuid).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -331,9 +320,89 @@ mod test {
         assert!(player_data_path.exists());
 
         // Load it again and verify content
-        let (success, loaded_data) = storage.load_player_data(&uuid).unwrap();
-        assert!(success);
+        let loaded_data = storage.load_player_data(&uuid).unwrap().unwrap();
         assert_eq!(loaded_data.get_string("name").unwrap(), "TestPlayer");
         assert_eq!(loaded_data.get_int("level").unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn second_save_keeps_previous_content_as_dat_old() {
+        let temp_dir = tempdir().unwrap();
+        let storage = PlayerDataStorage::new(temp_dir.path().to_path_buf(), true);
+        let uuid = Uuid::new_v4();
+
+        let mut first = NbtCompound::new();
+        first.put_int("generation", 1);
+        storage.save_player_data(&uuid, first).unwrap();
+
+        let mut second = NbtCompound::new();
+        second.put_int("generation", 2);
+        storage.save_player_data(&uuid, second).unwrap();
+
+        // 新内容进 .dat，上一份留在 .dat_old，并且不留临时文件。
+        assert!(storage.get_player_backup_path(&uuid).is_file());
+        assert_eq!(
+            storage
+                .load_player_data(&uuid)
+                .unwrap()
+                .unwrap()
+                .get_int("generation")
+                .unwrap(),
+            2
+        );
+        let leftover_tmp = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp);
+    }
+
+    #[tokio::test]
+    async fn corrupted_dat_falls_back_to_dat_old_and_keeps_a_corrupted_copy() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().to_path_buf();
+        let storage = PlayerDataStorage::new(path.clone(), true);
+        let uuid = Uuid::new_v4();
+
+        let mut good = NbtCompound::new();
+        good.put_int("generation", 1);
+        storage.save_player_data(&uuid, good).unwrap();
+        // 再存一次，让第一份内容进入 .dat_old。
+        let mut newer = NbtCompound::new();
+        newer.put_int("generation", 2);
+        storage.save_player_data(&uuid, newer).unwrap();
+
+        // 模拟崩溃留下的半截文件。
+        std::fs::write(storage.get_player_data_path(&uuid), b"truncated garbage").unwrap();
+
+        // 应该回退到 .dat_old 里的第一代数据，而不是报告「没有存档」。
+        let recovered = storage.load_player_data(&uuid).unwrap().unwrap();
+        assert_eq!(recovered.get_int("generation").unwrap(), 1);
+
+        // 损坏的文件被另存为 <uuid>_corrupted_<时间戳>.dat，没有被直接删掉。
+        let corrupted_marker = format!("{uuid}_corrupted_");
+        let has_corrupted_copy = std::fs::read_dir(&path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&corrupted_marker)
+            });
+        assert!(has_corrupted_copy);
+    }
+
+    #[tokio::test]
+    async fn unreadable_dat_without_backup_is_an_error_not_a_new_player() {
+        let temp_dir = tempdir().unwrap();
+        let storage = PlayerDataStorage::new(temp_dir.path().to_path_buf(), true);
+        let uuid = Uuid::new_v4();
+
+        // 只有一个损坏的 .dat，没有 .dat_old 可以回退。
+        std::fs::write(storage.get_player_data_path(&uuid), b"truncated garbage").unwrap();
+
+        // 必须是 Err —— 若变成 Ok(None) 就会被当成新玩家并覆盖存档。
+        assert!(storage.load_player_data(&uuid).is_err());
     }
 }
