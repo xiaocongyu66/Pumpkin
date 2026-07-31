@@ -19,6 +19,15 @@
 //!
 //! Registering either one now would mean shipping a command that silently
 //! always fails, so they stay out until the underlying lookups exist.
+//!
+//! Known limitation inherited from `find_nearest_structure`: vanilla filters
+//! candidates through `StructureManager.checkStructurePresence` and the
+//! structure's biome predicate (`ChunkGenerator.java:239-241`), so it only
+//! reports positions where the structure really starts. Pumpkin's finder
+//! returns the position placement math *predicts*, without that confirmation,
+//! so a reported position can be a candidate chunk that would not actually
+//! generate the structure. This affects the existing eye-of-ender caller the
+//! same way and is not introduced here.
 
 use pumpkin_data::structures::StructureSet;
 use pumpkin_data::translation;
