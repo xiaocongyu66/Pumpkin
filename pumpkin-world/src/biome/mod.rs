@@ -3,6 +3,7 @@ use std::cell::RefCell;
 
 use enum_dispatch::enum_dispatch;
 use pumpkin_data::chunk::{Biome, BiomeTree, NETHER_BIOME_SOURCE, OVERWORLD_BIOME_SOURCE};
+use pumpkin_data::dimension::Dimension;
 
 use crate::generation::noise::router::multi_noise_sampler::MultiNoiseSampler;
 pub mod end;
@@ -29,6 +30,55 @@ impl MultiNoiseBiomeSupplier {
 
     const fn new(source: &'static BiomeTree) -> Self {
         Self { source }
+    }
+
+    /// Every biome this supplier can return, i.e. vanilla's
+    /// `MultiNoiseBiomeSource.collectPossibleBiomes`
+    /// (`/root/Vanilla/src/net/minecraft/world/level/biome/MultiNoiseBiomeSource.java:57-60`),
+    /// which maps the climate parameter list to its biome values.
+    ///
+    /// Pumpkin stores that parameter list pre-compiled into a search tree, so the
+    /// equivalent is the set of biomes on the tree's leaves. Walking the whole
+    /// tree is only done once per generator (see
+    /// [`crate::generation::generator::VanillaGenerator`]), never per chunk.
+    #[must_use]
+    pub fn possible_biomes(&self) -> Vec<u16> {
+        let mut biomes = Vec::new();
+        let mut pending: Vec<&'static BiomeTree> = vec![self.source];
+        while let Some(node) = pending.pop() {
+            match node {
+                BiomeTree::Leaf { biome, .. } => biomes.push(u16::from(biome.id)),
+                BiomeTree::Branch { nodes, .. } => pending.extend(*nodes),
+            }
+        }
+        biomes.sort_unstable();
+        biomes.dedup();
+        biomes
+    }
+}
+
+/// The biomes that can actually occur in `dimension`, mirroring vanilla's
+/// `BiomeSource.possibleBiomes()`
+/// (`/root/Vanilla/src/net/minecraft/world/level/biome/BiomeSource.java:46-57`)
+/// for the biome source that dimension's chunk generator is built with.
+///
+/// The dimension dispatch matches the one the generation steps already use to
+/// pick a [`BiomeSupplier`] (see
+/// `crate::generation::proto_chunk::steps` and
+/// `crate::generation::proto_chunk::structures`), so the returned set is exactly
+/// the range of the supplier that dimension samples with.
+#[must_use]
+pub fn dimension_possible_biomes(dimension: &Dimension) -> Vec<u16> {
+    if *dimension == Dimension::THE_END {
+        end::TheEndBiomeSupplier::POSSIBLE_BIOMES.to_vec()
+    } else if *dimension == Dimension::THE_NETHER {
+        MultiNoiseBiomeSupplier::NETHER.possible_biomes()
+    } else {
+        // Overworld (and the caves variant, which uses the same biome source).
+        // `MultiNoiseBiomeSupplier::biome` may soft-remap a taiga sample to
+        // `FOREST`/`SNOWY_PLAINS`, but both are already overworld climate-tree
+        // leaves, so the reachable set is unchanged.
+        MultiNoiseBiomeSupplier::OVERWORLD.possible_biomes()
     }
 }
 
@@ -186,6 +236,53 @@ mod test {
                     data.z
                 );
             }
+        }
+    }
+
+    /// `dimension_possible_biomes` stands in for vanilla's
+    /// `BiomeSource.possibleBiomes()`, so each dimension must report exactly the
+    /// biomes its own supplier can return — and nothing from another dimension.
+    #[test]
+    fn dimension_possible_biomes_are_disjoint_per_dimension() {
+        use super::{dimension_possible_biomes, end::TheEndBiomeSupplier};
+
+        let overworld = dimension_possible_biomes(&Dimension::OVERWORLD);
+        let nether = dimension_possible_biomes(&Dimension::THE_NETHER);
+        let end = dimension_possible_biomes(&Dimension::THE_END);
+
+        // The end source is a fixed five-biome list (TheEndBiomeSource.java:47-50).
+        assert_eq!(end, TheEndBiomeSupplier::POSSIBLE_BIOMES.to_vec());
+
+        // The nether climate tree has exactly the five nether biomes.
+        let mut expected_nether = vec![
+            u16::from(Biome::NETHER_WASTES.id),
+            u16::from(Biome::CRIMSON_FOREST.id),
+            u16::from(Biome::WARPED_FOREST.id),
+            u16::from(Biome::SOUL_SAND_VALLEY.id),
+            u16::from(Biome::BASALT_DELTAS.id),
+        ];
+        expected_nether.sort_unstable();
+        assert_eq!(nether, expected_nether);
+
+        // A structure set is dropped by intersecting these lists, so an overlap
+        // would silently let e.g. nether fossils back into the overworld.
+        for biome in &nether {
+            assert!(!overworld.contains(biome), "biome {biome} in both");
+            assert!(!end.contains(biome), "biome {biome} in both");
+        }
+        for biome in &end {
+            assert!(!overworld.contains(biome), "biome {biome} in both");
+        }
+
+        // Spot-check the overworld's own leaves; the taiga soft-remap targets must
+        // be present, since they are what a remapped sample can return.
+        for biome in [
+            Biome::PLAINS,
+            Biome::FOREST,
+            Biome::SNOWY_PLAINS,
+            Biome::DESERT,
+        ] {
+            assert!(overworld.contains(&u16::from(biome.id)));
         }
     }
 

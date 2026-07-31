@@ -343,8 +343,12 @@ impl ProtoChunk {
 
         let diagnose = diagnostics::enabled();
 
-        for (i, set) in StructureSet::ALL.iter().enumerate() {
-            let allowed_biomes = &generator.structure_allowed_biomes[&i];
+        // `ChunkGenerator.createStructures` iterates
+        // `state.possibleStructureSets()` (`ChunkGenerator.java:605`), i.e. only the
+        // sets whose structures can occur in this dimension's biomes. `set_index`
+        // stays the `StructureSet::ALL` index the biome lists are keyed by.
+        for (set_index, set) in generator.possible_structure_sets() {
+            let allowed_biomes = &generator.structure_allowed_biomes[&set_index];
 
             let verdict = should_generate_structure(
                 &set.placement,
@@ -466,7 +470,10 @@ impl ProtoChunk {
         let calculator = &generator.structure_calculator;
         let diagnose = diagnostics::enabled();
 
-        for (set_index, set) in StructureSet::ALL.iter().enumerate() {
+        // Same dimension pre-filter as the start pass: vanilla propagates
+        // references from actual starts only, and a set that cannot start in this
+        // dimension has none. `set_index` remains the `StructureSet::ALL` index.
+        for (set_index, set) in generator.possible_structure_sets() {
             let set_allowed_biomes = &generator.structure_allowed_biomes[&set_index];
             let mut candidate_chunks = Vec::new();
 
