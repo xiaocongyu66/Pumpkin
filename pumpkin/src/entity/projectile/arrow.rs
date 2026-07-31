@@ -362,10 +362,19 @@ impl EntityBase for ArrowEntity {
                     self.shake_time.store(7, Ordering::Relaxed);
                     *self.last_block_pos.write().unwrap() = Some(pos);
 
+                    // 原版 `Level.gameEvent(GameEvent.PROJECTILE_LAND, pos,
+                    // Context.of(this, ...))` 会带上射手，监守者据此把愤怒记到射手
+                    // 头上而不是箭上（Warden.java:646-657）。
+                    let shooter_uuid = self
+                        .owner_id
+                        .and_then(|id| world.get_entity_by_id(id))
+                        .map(|owner| owner.get_entity().entity_uuid);
                     world
-                        .emit_vibration(
+                        .emit_vibration_from(
                             crate::world::vibrations::Vibration::ProjectileLand,
                             entity.pos.load(),
+                            None,
+                            shooter_uuid,
                         )
                         .await;
 

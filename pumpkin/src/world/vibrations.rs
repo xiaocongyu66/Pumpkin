@@ -134,6 +134,33 @@ impl World {
     /// Vanilla `Level.gameEvent` reduced to vibration dispatch: wakes every
     /// sculk sensor in listening range of the event.
     pub async fn emit_vibration(self: &Arc<Self>, event: Vibration, source: Vector3<f64>) {
+        self.emit_vibration_from(event, source, None, None).await;
+    }
+
+    /// 带声源实体的振动分发，对应原版 `Level.gameEvent(event, position,
+    /// GameEvent.Context.of(entity, state))` 里的 `Context.sourceEntity`。
+    ///
+    /// 幽匿感测体只关心频率与距离，用不到声源身份；监守者要靠它把愤怒记到具体
+    /// 实体头上（原版 `Warden.VibrationUser.onReceiveVibration`，Warden.java:638-667），
+    /// 所以在这里把声源一并传下去。`projectile_owner` 对应原版同一方法的
+    /// `projectileOwner` 参数。
+    pub async fn emit_vibration_from(
+        self: &Arc<Self>,
+        event: Vibration,
+        source: Vector3<f64>,
+        source_entity: Option<uuid::Uuid>,
+        projectile_owner: Option<uuid::Uuid>,
+    ) {
+        // 监守者不依赖幽匿感测体，必须在下面的 `has_sculk_sensors` 提前返回之前分发。
+        crate::entity::mob::warden::WardenEntity::dispatch_vibration(
+            self,
+            event,
+            source,
+            source_entity,
+            projectile_owner,
+        )
+        .await;
+
         // Worlds without a single sculk sensor skip the chunk scan entirely.
         if !self
             .has_sculk_sensors
