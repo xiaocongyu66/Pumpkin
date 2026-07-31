@@ -168,7 +168,6 @@ impl VanillaGenerator {
     /// The index is what [`Self::structure_allowed_biomes`] is keyed by, so the
     /// structure passes must carry it through rather than re-deriving a position
     /// from the filtered list.
-    #[must_use]
     pub fn possible_structure_sets(
         &self,
     ) -> impl Iterator<Item = (usize, &'static StructureSet)> + '_ {

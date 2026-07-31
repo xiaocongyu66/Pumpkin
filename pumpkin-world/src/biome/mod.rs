@@ -57,8 +57,9 @@ impl MultiNoiseBiomeSupplier {
     }
 }
 
-/// The biomes that can actually occur in `dimension`, mirroring vanilla's
-/// `BiomeSource.possibleBiomes()`
+/// The biomes that can actually occur in `dimension`.
+///
+/// Mirrors vanilla's `BiomeSource.possibleBiomes()`
 /// (`/root/Vanilla/src/net/minecraft/world/level/biome/BiomeSource.java:46-57`)
 /// for the biome source that dimension's chunk generator is built with.
 ///
