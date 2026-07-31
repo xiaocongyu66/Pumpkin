@@ -1,8 +1,8 @@
 /* This file is generated. Do not edit manually. */
 use pumpkin_util::math::floor_div;
 use pumpkin_util::random::{
-    get_carver_seed, get_region_seed, legacy_rand::LegacyRand, xoroshiro128::Xoroshiro,
-    RandomGenerator, RandomImpl,
+    RandomGenerator, RandomImpl, get_carver_seed, get_region_seed, legacy_rand::LegacyRand,
+    xoroshiro128::Xoroshiro,
 };
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum StructureKeys {
@@ -898,8 +898,7 @@ impl Structure {
                             },
                             PoolAliasBinding::Direct {
                                 alias: "minecraft:trial_chambers/spawner/contents/slow_ranged",
-                                target:
-                                    "minecraft:trial_chambers/spawner/slow_ranged/poison_skeleton",
+                                target: "minecraft:trial_chambers/spawner/slow_ranged/poison_skeleton",
                             },
                         ],
                         weight: 1u32,

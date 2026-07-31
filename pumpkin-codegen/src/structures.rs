@@ -3,6 +3,11 @@ use quote::{ToTokens, format_ident, quote};
 use serde::{Deserialize, Deserializer, de};
 use std::{collections::BTreeMap, fs};
 
+use crate::entity_type::MobCategory;
+
+/// Registry name that vanilla substitutes for every `MISC`-category spawn entry.
+const MISC_SPAWN_REPLACEMENT: &str = "minecraft:pig";
+
 /// Deserialized structure set containing placement rules and weighted structure entries.
 #[derive(Deserialize)]
 pub struct StructureSetStruct {
@@ -105,6 +110,10 @@ pub struct StructureStruct {
     pub pool_aliases: Vec<PoolAliasBindingStruct>,
     /// Per-category natural-spawn overrides. Missing categories intentionally
     /// remain distinct from present categories with empty spawn lists.
+    ///
+    /// A missing key and an empty map both mean "no override", matching vanilla
+    /// `Map::get` returning `null` for every category, so the field defaults.
+    #[serde(default)]
     pub spawn_overrides: BTreeMap<StructureSpawnCategoryStruct, StructureSpawnOverrideStruct>,
 
     /// Defines the generation behavior (e.g. "minecraft:jigsaw").
@@ -200,6 +209,50 @@ impl<'de> Deserialize<'de> for StructureSpawnEntryStruct {
             max_count: entry.max_count,
             weight: entry.weight,
         })
+    }
+}
+
+/// Reads `entities.json` and collects the registry names whose `MobCategory` is `MISC`.
+///
+/// Only the category is needed here, so the full `EntityType` shape is skipped.
+fn misc_category_entity_names() -> std::collections::BTreeSet<String> {
+    /// Minimal projection of an `entities.json` entry: just the mob category.
+    #[derive(Deserialize)]
+    struct CategoryOnly {
+        category: MobCategory,
+    }
+
+    let entities: BTreeMap<String, CategoryOnly> =
+        serde_json::from_str(&fs::read_to_string("../assets/entities.json").unwrap())
+            .expect("Failed to parse entities.json");
+
+    entities
+        .into_iter()
+        .filter(|(_, entity)| matches!(entity.category, MobCategory::MISC))
+        .map(|(name, _)| format!("minecraft:{name}"))
+        .collect()
+}
+
+/// Applies vanilla's `SpawnerData` canonical-constructor substitution to every
+/// structure spawn entry.
+///
+/// Vanilla 26.2 `MobSpawnSettings.java:82-84` rewrites the entity type of *any*
+/// `SpawnerData` whose type is in `MobCategory.MISC` to `EntityTypes.PIG`, and the
+/// record's canonical constructor runs for every deserialized entry. The
+/// substitution keys off the entity type's own category, not the
+/// `spawn_overrides` map key, so a `MISC`-typed mob listed under `monster` is
+/// rewritten too.
+fn remap_misc_spawn_types(structures: &mut BTreeMap<String, StructureStruct>) {
+    let misc_entities = misc_category_entity_names();
+
+    for structure in structures.values_mut() {
+        for override_data in structure.spawn_overrides.values_mut() {
+            for entry in &mut override_data.spawns {
+                if misc_entities.contains(&entry.r#type) {
+                    entry.r#type = MISC_SPAWN_REPLACEMENT.to_owned();
+                }
+            }
+        }
     }
 }
 
@@ -953,9 +1006,11 @@ fn generation_step_to_token(step: &str) -> TokenStream {
 
 /// Reads `structures.json` and `structure_set.json` and emits the complete structures `TokenStream`.
 pub fn build() -> TokenStream {
-    let structures_json: BTreeMap<String, StructureStruct> =
+    let mut structures_json: BTreeMap<String, StructureStruct> =
         serde_json::from_str(&fs::read_to_string("../assets/structures.json").unwrap())
             .expect("Failed to parse structures.json");
+
+    remap_misc_spawn_types(&mut structures_json);
 
     let structure_sets_json: BTreeMap<String, StructureSetStruct> =
         serde_json::from_str(&fs::read_to_string("../assets/structure_set.json").unwrap())

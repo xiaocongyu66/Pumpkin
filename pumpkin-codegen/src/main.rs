@@ -228,6 +228,12 @@ pub struct RustFmtError;
 
 /// Formats a Rust source string by piping it through `rustfmt`.
 ///
+/// The edition is passed explicitly instead of relying on `rustfmt.toml` discovery,
+/// which depends on the invoking working directory. Style rules differ between
+/// editions (2024 sorts `use` items with a lowercase-last ordering, earlier ones do
+/// not), so leaving it implicit lets generated files pick up an ordering that
+/// `cargo fmt` would not produce.
+///
 /// # Arguments
 /// - `unformatted_code` – Raw Rust source code to format.
 ///
@@ -236,6 +242,8 @@ pub struct RustFmtError;
 /// or formatting fails.
 pub fn format_code(unformatted_code: &str) -> Result<String, RustFmtError> {
     let child_result = Command::new("rustfmt")
+        .arg("--edition")
+        .arg("2024")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
