@@ -1,5 +1,6 @@
 use super::{Mob, PathAwareEntity};
 use crate::entity::EntityBaseFuture;
+use crate::entity::ai::goal::Controls;
 use crate::entity::player::Player;
 use crate::entity::{Entity, EntityBase, NBTStorage, living::LivingEntity};
 use crate::server::Server;
@@ -57,7 +58,7 @@ impl<T: Mob + Send + 'static> EntityBase for T {
     ) -> EntityBaseFuture<'a, ()> {
         Box::pin(async move {
             let mob_entity = self.get_mob_entity();
-            mob_entity.living_entity.entity.tick_leash().await;
+            mob_entity.living_entity.entity.tick_leash(self).await;
             mob_entity.tick_sun_burn().await;
 
             // Despawn far mobs so natural spawn caps free up (vanilla checkDespawn).
@@ -187,6 +188,52 @@ impl<T: Mob + Send + 'static> EntityBase for T {
 
     fn is_collidable(&self, _entity: Option<Box<dyn EntityBase>>) -> bool {
         true
+    }
+
+    /// 原版 `Mob.onLeashRemoved`（Mob.java:1295-1300）：
+    /// `if (this.getLeashData() == null) this.clearHome();`
+    ///
+    /// Pumpkin 没有独立的 `LeashData`，`leashed_to == None` 即等价于
+    /// `getLeashData() == null`；`clearHome()`（Mob.java:1247-1249，
+    /// `homeRadius = -1`）对应 `position_target_range = -1`
+    /// （见 `mob/mod.rs:136-137` 用 -1 表示无 home）。
+    fn on_leash_removed(&self) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async move {
+            let mob_entity = self.get_mob_entity();
+            let still_leashed = {
+                let guard = mob_entity.living_entity.entity.leashed_to.lock().await;
+                guard.is_some()
+            };
+            if !still_leashed {
+                mob_entity.position_target_range.store(-1, Relaxed);
+            }
+        })
+    }
+
+    /// 原版 `Mob.leashTooFarBehaviour`（Mob.java:1302-1306）：
+    /// 先走接口默认的 `dropLeash()`，再 `goalSelector.disableControlFlag(Goal.Flag.MOVE)`。
+    fn leash_too_far_behaviour(&self) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async move {
+            self.drop_leash().await;
+            {
+                let mut goals_selector = self.get_mob_entity().goals_selector.lock().unwrap();
+                goals_selector.disable_control(Controls::MOVE);
+            }
+        })
+    }
+
+    /// 原版 `Mob.startRiding`（Mob.java:1315-1320）：上载具成功且仍被拴住时 `dropLeash()`。
+    fn on_start_riding(&self) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async move {
+            let is_leashed = {
+                let entity = &self.get_mob_entity().living_entity.entity;
+                let guard = entity.leashed_to.lock().await;
+                guard.is_some()
+            };
+            if is_leashed {
+                self.drop_leash().await;
+            }
+        })
     }
 
     /// 原版 `Mob` 不覆写 `isPushable()`，直接继承 `LivingEntity#isPushable`

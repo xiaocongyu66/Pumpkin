@@ -128,12 +128,9 @@ impl EntityBase for LeashKnotEntity {
                         .unwrap_or(false);
 
                     if is_attached_to_knot {
-                        ent.unleash().await;
-                        let lead_item = pumpkin_data::item_stack::ItemStack::new(
-                            1,
-                            &pumpkin_data::item::Item::LEAD,
-                        );
-                        world.drop_stack(&ent.block_pos.load(), lead_item).await;
+                        // 走 drop_leash()（原版 Leashable.java:119-121）：掉落 lead、
+                        // 广播解绑包，并触发 onLeashRemoved / notifyLeasheeRemoved。
+                        entity_base.drop_leash().await;
                     }
                 }
 
@@ -202,6 +199,16 @@ impl EntityBase for LeashKnotEntity {
                 true
             } else {
                 false
+            }
+        })
+    }
+
+    /// 原版 `LeashFenceKnotEntity.notifyLeasheeRemoved`
+    /// （LeashFenceKnotEntity.java:115-120）：最后一个被拴实体解绑后拴绳结自我销毁。
+    fn notify_leashee_removed(&self) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async move {
+            if self.entity.leashable_leashed_to().is_empty() {
+                self.entity.remove().await;
             }
         })
     }
