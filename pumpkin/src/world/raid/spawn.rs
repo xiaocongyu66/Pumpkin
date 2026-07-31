@@ -113,6 +113,15 @@ pub fn plan_wave(
     plan
 }
 
+/// 候选生成点到突袭中心的最大水平偏移。
+///
+/// `Raid.java:573-580` 的偏移是
+/// `howFar * VILLAGE_SEARCH_RADIUS + random(0..3) * howFar`，其中
+/// `howFar = 0.22 * secondsRemaining - 0.24`。`secondsRemaining` 最大是
+/// `DEFAULT_PRE_RAID_TICKS / 20 = 15`，于是 `howFar <= 3.06`，单轴偏移不超过
+/// `3.06 * 32 + 2 * 3.06 ≈ 104`。取 128 留足余量。
+const MAX_SPAWN_RING_OFFSET: i32 = 128;
+
 /// Vanilla `Raid.findRandomSpawnPos` (`Raid.java:571-589`).
 ///
 /// The ring radius shrinks as the countdown runs out:
@@ -125,14 +134,22 @@ pub fn plan_wave(
 /// to "snow below and air here" (`Raid.java:585`). Pumpkin's
 /// `natural_spawner::rules::is_spawn_position_ok` is the port of that placement type, so
 /// it is used directly; the snow fallback is reproduced verbatim.
-#[must_use]
-pub fn find_random_spawn_pos(
+pub async fn find_random_spawn_pos(
     world: &Arc<World>,
     center: BlockPos,
     raid_cooldown_ticks: i32,
     max_tries: i32,
 ) -> Option<BlockPos> {
     let seconds_remaining = raid_cooldown_ticks / 20;
+    // 所有候选点都在 `MAX_SPAWN_RING_OFFSET` 之内，所以一份快照能回答全部
+    // `isVillage`，不必每次尝试都重查 POI。
+    let snapshot = village::village_poi_snapshot(
+        world,
+        center,
+        village::snapshot_radius_for_blocks(MAX_SPAWN_RING_OFFSET),
+        village::QueryShape::Square,
+    )
+    .await;
     #[expect(
         clippy::cast_precision_loss,
         reason = "seconds_remaining is at most 15; vanilla does the same float cast"
@@ -163,7 +180,7 @@ pub fn find_random_spawn_pos(
         let pos = BlockPos::new(spawn_x, spawn_y, spawn_z);
 
         // Raid.java:583 — refuse to spawn inside the village until the last seconds.
-        if village::is_village(world, &pos)
+        if village::is_village_in_snapshot(&pos, &snapshot)
             && seconds_remaining > ALLOW_SPAWNING_WITHIN_VILLAGE_SECONDS_THRESHOLD
         {
             continue;
@@ -262,7 +279,7 @@ pub fn play_raid_horn(world: &Arc<World>, origin: BlockPos, bar_audience: &[Uuid
 /// calls this for every live raid.
 pub async fn tick_raid(world: &Arc<World>, raid: &Arc<Raid>) {
     // Phase 1 — sample the level, as vanilla's tick does inline.
-    let facts = WorldFacts::sample(world, raid.center());
+    let facts = WorldFacts::sample(world, raid.center()).await;
 
     // Phase 2 — advance every counter with the lock held, then drop it.
     let plan = raid.advance(&facts);
@@ -277,14 +294,14 @@ pub async fn tick_raid(world: &Arc<World>, raid: &Arc<Raid>) {
     if plan.find_spawn_pos {
         let center = raid.center();
         let cooldown = raid.with(|inner| inner.state.raid_cooldown_ticks);
-        let found = find_random_spawn_pos(world, center, cooldown, 8);
+        let found = find_random_spawn_pos(world, center, cooldown, 8).await;
         raid.with(|inner| inner.wave_spawn_pos = found);
     }
 
     // Raid.java:303-305 — `updateRaiders` runs on the same once-a-second beat.
     if plan.refresh_players {
         refresh_bossbar_audience(world, raid).await;
-        prune_raiders(world, raid);
+        prune_raiders(world, raid).await;
     }
 
     // Raid.java:319-336 — `advance` schedules the one possible successful spawn.
@@ -297,9 +314,13 @@ pub async fn tick_raid(world: &Arc<World>, raid: &Arc<Raid>) {
             let center = raid.center();
             let cooldown = raid.with(|inner| inner.state.raid_cooldown_ticks);
             // Raid.java:322 — the cached position first, else a 20-try search.
-            let spawn_pos = raid
-                .with(|inner| inner.wave_spawn_pos)
-                .or_else(|| find_random_spawn_pos(world, center, cooldown, 20));
+            // `or_else` 无法承载 async 闭包，所以拆成两步；缓存命中时依然不搜。
+            let cached = raid.with(|inner| inner.wave_spawn_pos);
+            let spawn_pos = if cached.is_some() {
+                cached
+            } else {
+                find_random_spawn_pos(world, center, cooldown, 20).await
+            };
 
             // Vanilla's `playedSound` guard only matters because its loop can
             // spawn more than once; this port spawns at most one wave per tick,
@@ -390,12 +411,22 @@ async fn refresh_bossbar_audience(world: &Arc<World>, raid: &Arc<Raid>) {
 }
 
 /// Vanilla `Raid.updateRaiders` (`Raid.java:411-438`), against the live world.
-fn prune_raiders(world: &Arc<World>, raid: &Arc<Raid>) {
+async fn prune_raiders(world: &Arc<World>, raid: &Arc<Raid>) {
     let center = raid.center();
     let members = raid.all_raiders();
     if members.is_empty() {
         return;
     }
+
+    // 每个掠夺者都要问一次 `isVillage`，但超过 `RAID_REMOVAL_THRESHOLD` 的会先被距离
+    // 判定剔除（`Raid.java:418`），所以一份以突袭中心为心的快照覆盖得住全部判定。
+    let snapshot = village::village_poi_snapshot(
+        world,
+        center,
+        village::snapshot_radius_for_blocks(village::RAID_REMOVAL_THRESHOLD),
+        village::QueryShape::Square,
+    )
+    .await;
 
     let registry = &world.raids.raiders;
     let mut facts = Vec::with_capacity(members.len());
@@ -429,7 +460,7 @@ fn prune_raiders(world: &Arc<World>, raid: &Arc<Raid>) {
                         .squared_distance_to_vec(&center.to_centered_f64()),
                     base.age.load(std::sync::atomic::Ordering::Relaxed),
                     health,
-                    village::is_village(world, &pos),
+                    village::is_village_in_snapshot(&pos, &snapshot),
                     0,
                 )
             }

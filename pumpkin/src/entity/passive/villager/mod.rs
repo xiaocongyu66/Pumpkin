@@ -27,6 +27,7 @@ use crate::entity::{
 pub mod data;
 mod job;
 mod nbt;
+mod poi;
 mod trading;
 pub use data::{
     BREEDING_FOOD_THRESHOLD, GossipType, VillagerData, VillagerProfession, VillagerType,
@@ -46,6 +47,11 @@ pub struct VillagerEntity {
     pub offers: Mutex<Vec<pumpkin_protocol::java::client::play::MerchantOffer>>,
     pub job_site: std::sync::Mutex<Option<BlockPos>>,
     pub home_pos: std::sync::Mutex<Option<BlockPos>>,
+    /// 「`job_site` / `home_pos` 那张 POI 票据在我手上」的标记，见 `poi.rs` 模块文档。
+    ///
+    /// 不对外公开：只有 `poi.rs` 里的认领/归还路径该动它，否则标记会和存储里的
+    /// 票据分叉。子模块能看到父模块的私有字段，所以 `poi.rs` 照样可以访问。
+    held_tickets: poi::HeldTickets,
     pub self_weak: std::sync::Mutex<Option<Weak<Self>>>,
 }
 
@@ -79,6 +85,7 @@ impl VillagerEntity {
             offers: Mutex::new(Vec::new()),
             job_site: std::sync::Mutex::new(None),
             home_pos: std::sync::Mutex::new(None),
+            held_tickets: poi::HeldTickets::default(),
             self_weak: std::sync::Mutex::new(None),
         };
         let mob_arc = Arc::new(villager);

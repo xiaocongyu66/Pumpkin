@@ -11,7 +11,7 @@ use pumpkin_data::meta_data_type::MetaDataType;
 use pumpkin_data::tag::Taggable;
 use pumpkin_data::tracked_data::TrackedData;
 use pumpkin_protocol::java::client::play::Metadata;
-use pumpkin_util::math::{boundingbox::BoundingBox, position::BlockPos, vector3::Vector3};
+use pumpkin_util::math::position::BlockPos;
 
 use crate::entity::player::Player;
 use crate::entity::{
@@ -55,6 +55,15 @@ fn block_to_profession(block: &Block) -> Option<VillagerProfession> {
     } else {
         None
     }
+}
+
+/// 把「候选位置 + 到村民的距离平方」按距离从近到远排好，只留位置。
+///
+/// 对应原版 `PoiManager.findAllClosestFirstWithType`
+/// (`PoiManager.java:113-115`) 的排序：认领时第一个取到票的就是最近的那个。
+fn sorted_by_distance(mut candidates: Vec<(BlockPos, f64)>) -> Vec<BlockPos> {
+    candidates.sort_by(|(_, a), (_, b)| a.total_cmp(b));
+    candidates.into_iter().map(|(pos, _)| pos).collect()
 }
 
 fn profession_matches_block(profession: VillagerProfession, block: &Block) -> bool {
@@ -154,8 +163,14 @@ impl Mob for VillagerEntity {
                     false
                 };
 
+                // 床还在，但票据可能还不在我手上（老存档，或刚从 NBT 读回来）：
+                // 对账一次，抢不到票就等于这张床已被别人认领，绑定不成立。
+                let valid = valid && self.ensure_home_ticket(current_home).await;
+
                 if !valid {
-                    *self.home_pos.lock().unwrap() = None;
+                    // 归还票据 + 清空 `home_pos`（原版 `releasePoi(HOME)` +
+                    // 擦记忆槽，`Villager.java:577-592`）。
+                    self.clear_home().await;
                     if is_sleeping {
                         // Wake up if bed was broken
                         self.get_entity().set_pose(EntityPose::Standing);
@@ -177,61 +192,31 @@ impl Mob for VillagerEntity {
                 let start = BlockPos::new(pos.0.x - 16, pos.0.y - 4, pos.0.z - 16);
                 let end = BlockPos::new(pos.0.x + 16, pos.0.y + 4, pos.0.z + 16);
 
-                let aabb = BoundingBox::new(
-                    Vector3::new(
-                        pos.0.x as f64 - 32.0,
-                        pos.0.y as f64 - 16.0,
-                        pos.0.z as f64 - 32.0,
-                    ),
-                    Vector3::new(
-                        pos.0.x as f64 + 32.0,
-                        pos.0.y as f64 + 16.0,
-                        pos.0.z as f64 + 32.0,
-                    ),
-                );
-                let nearby_entities = world.get_all_at_box(&aabb);
-
-                let mut claimed_homes = Vec::new();
-                for entity in nearby_entities {
-                    if entity.get_entity().entity_id != self.get_entity().entity_id
-                        && entity.get_entity().entity_type
-                            == &pumpkin_data::entity::EntityType::VILLAGER
-                        && let Some(home) = entity.get_home_pos()
-                    {
-                        claimed_homes.push(home);
-                    }
-                }
-
-                let mut best_home = None;
-                let mut best_dist = f64::MAX;
-
+                // 候选按距离从近到远排好，交给票据认领去决出归属 —— 谁抢到
+                // `minecraft:home` 那唯一一张票（`PoiTypes.java:104`）就是谁的床。
+                // 不再扫周围村民的 `home_pos`：存储里的票据本身就是排他的，正如原版
+                // `AcquirePoi` 只按 `Occupancy.HAS_SPACE` 过滤（`AcquirePoi.java:107`）。
+                let self_pos = self.get_entity().pos.load();
+                let mut candidates = Vec::new();
                 for p in BlockPos::iterate(start, end) {
                     let (block, state) = world.get_block_and_state(&p);
                     if block.has_tag(&pumpkin_data::tag::Block::MINECRAFT_BEDS) {
                         let bed_props = BedProperties::from_state_id(state.id, block);
+                        // POI 只索引床头（`PoiTypes.java:53`），床尾要换算过去。
                         let bed_head_pos = if bed_props.part == BedPart::Head {
                             p
                         } else {
                             p.offset(bed_props.facing.to_offset())
                         };
-
-                        if claimed_homes.contains(&bed_head_pos) {
+                        if candidates.iter().any(|(pos, _)| *pos == bed_head_pos) {
                             continue;
                         }
-
-                        let dist = bed_head_pos
-                            .to_f64()
-                            .squared_distance_to_vec(&self.get_entity().pos.load());
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_home = Some(bed_head_pos);
-                        }
+                        let dist = bed_head_pos.to_f64().squared_distance_to_vec(&self_pos);
+                        candidates.push((bed_head_pos, dist));
                     }
                 }
 
-                if let Some(home) = best_home {
-                    *self.home_pos.lock().unwrap() = Some(home);
-                }
+                self.acquire_home(&sorted_by_distance(candidates)).await;
             }
 
             // Handle Sleeping/Waking up based on time
@@ -312,8 +297,14 @@ impl Mob for VillagerEntity {
                     profession_matches_block(profession, block)
                 };
 
+                // 工作站方块还在，但票据可能还不在我手上（老存档 / 刚读 NBT）：
+                // 对账一次，抢不到票说明这个工作站已被别的村民认领。
+                let valid = valid && self.ensure_job_site_ticket(current_site).await;
+
                 if !valid {
-                    *self.job_site.lock().unwrap() = None;
+                    // 归还票据 + 清空 `job_site`（原版 `releasePoi(JOB_SITE)`，
+                    // `Villager.java:577-592`）。
+                    self.clear_job_site().await;
                     if xp == 0 && profession != VillagerProfession::None {
                         let r#type = self.villager_data.lock().await.type_enum();
                         self.set_villager_data(VillagerData::new(
@@ -332,62 +323,30 @@ impl Mob for VillagerEntity {
                 let start = BlockPos::new(pos.0.x - 10, pos.0.y - 4, pos.0.z - 10);
                 let end = BlockPos::new(pos.0.x + 10, pos.0.y + 4, pos.0.z + 10);
 
-                let aabb = BoundingBox::new(
-                    Vector3::new(
-                        pos.0.x as f64 - 32.0,
-                        pos.0.y as f64 - 16.0,
-                        pos.0.z as f64 - 32.0,
-                    ),
-                    Vector3::new(
-                        pos.0.x as f64 + 32.0,
-                        pos.0.y as f64 + 16.0,
-                        pos.0.z as f64 + 32.0,
-                    ),
-                );
-                let nearby_entities = world.get_all_at_box(&aabb);
-
-                let mut claimed_sites = Vec::new();
-                for entity in nearby_entities {
-                    if entity.get_entity().entity_id != self.get_entity().entity_id
-                        && entity.get_entity().entity_type
-                            == &pumpkin_data::entity::EntityType::VILLAGER
-                        && let Some(site) = entity.get_job_site_pos()
-                    {
-                        claimed_sites.push(site);
-                    }
-                }
-
-                let mut best_site = None;
-                let mut best_dist = f64::MAX;
-                let mut best_profession = VillagerProfession::None;
-
+                // 同床位：候选按距离排好后交给票据认领决出归属，不再扫周围村民的
+                // `job_site`。工作站的 `maxTickets` 也是 1（`PoiTypes.java:91-103`）。
+                let self_pos = self.get_entity().pos.load();
+                let mut candidates = Vec::new();
                 for p in BlockPos::iterate(start, end) {
-                    if claimed_sites.contains(&p) {
-                        continue;
-                    }
-
                     let (block, _state) = world.get_block_and_state(&p);
                     if let Some(prof) = block_to_profession(block) {
                         if profession != VillagerProfession::None && prof != profession {
                             continue;
                         }
-
-                        let dist = p
-                            .to_f64()
-                            .squared_distance_to_vec(&self.get_entity().pos.load());
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_site = Some(p);
-                            best_profession = prof;
-                        }
+                        let dist = p.to_f64().squared_distance_to_vec(&self_pos);
+                        candidates.push((p, dist));
                     }
                 }
 
-                if let Some(site) = best_site {
-                    *self.job_site.lock().unwrap() = Some(site);
-                    if profession == VillagerProfession::None {
+                if let Some(site) = self.acquire_job_site(&sorted_by_distance(candidates)).await
+                    && profession == VillagerProfession::None
+                {
+                    // 由真正认领到的那个方块决定职业，对应原版
+                    // `AssignProfessionFromJobSite`（`VillagerGoalPackages.java:99`）。
+                    let (block, _state) = world.get_block_and_state(&site);
+                    if let Some(prof) = block_to_profession(block) {
                         let r#type = self.villager_data.lock().await.type_enum();
-                        self.set_villager_data(VillagerData::new(r#type, best_profession, 1))
+                        self.set_villager_data(VillagerData::new(r#type, prof, 1))
                             .await;
                     }
                 }

@@ -85,21 +85,32 @@ pub struct WorldFacts {
 
 impl WorldFacts {
     /// Samples the level exactly where vanilla's `tick` would.
-    #[must_use]
-    pub fn sample(world: &Arc<World>, center: BlockPos) -> Self {
+    ///
+    /// 三处村庄判定共用一份 POI 快照：`isVillage(center)`、
+    /// `moveRaidCenterToNearbyVillageSection` 扫的 125 个 section 中心，以及重定位后
+    /// 的第二次 `isVillage`。原版三处都问同一张距离场，这里也就只查一次 POI。
+    pub async fn sample(world: &Arc<World>, center: BlockPos) -> Self {
         let center_chunk_loaded = is_chunk_loaded(world, center);
         let difficulty = world.level_info.load().difficulty;
-        let center_is_village = village::is_village(world, &center);
+
+        let snapshot = village::village_poi_snapshot(
+            world,
+            center,
+            village::snapshot_radius_for_sections(SECTION_RADIUS_FOR_FINDING_NEW_VILLAGE_CENTER),
+            village::QueryShape::Square,
+        )
+        .await;
+        let center_is_village = village::is_village_in_snapshot(&center, &snapshot);
 
         // Vanilla only relocates when the centre stopped being a village.
         let relocated_center = if center_is_village {
             None
         } else {
-            nearest_village_section_center(world, center)
+            nearest_village_section_center(center, &snapshot)
         };
         let relocated_is_village = relocated_center
             .as_ref()
-            .is_some_and(|pos| village::is_village(world, pos));
+            .is_some_and(|pos| village::is_village_in_snapshot(pos, &snapshot));
 
         Self {
             center_chunk_loaded,
@@ -136,7 +147,7 @@ pub fn is_position_entity_ticking(world: &Arc<World>, pos: BlockPos) -> bool {
 /// Scans the 5×5×5 cube of sections around the centre
 /// (`SectionPos.cube(SectionPos.of(center), 2)`), keeps those that are villages,
 /// and picks the section centre closest to the current raid centre.
-fn nearest_village_section_center(world: &Arc<World>, center: BlockPos) -> Option<BlockPos> {
+fn nearest_village_section_center(center: BlockPos, snapshot: &[BlockPos]) -> Option<BlockPos> {
     let radius = SECTION_RADIUS_FOR_FINDING_NEW_VILLAGE_CENTER;
     let (sx, sy, sz) = (center.0.x >> 4, center.0.y >> 4, center.0.z >> 4);
     let mut best: Option<(BlockPos, i32)> = None;
@@ -150,7 +161,7 @@ fn nearest_village_section_center(world: &Arc<World>, center: BlockPos) -> Optio
                     ((sy + dy) << 4) + 8,
                     ((sz + dz) << 4) + 8,
                 );
-                if !village::is_village(world, &candidate) {
+                if !village::is_village_in_snapshot(&candidate, snapshot) {
                     continue;
                 }
                 let distance = candidate.squared_distance(&center);

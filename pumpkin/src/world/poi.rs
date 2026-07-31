@@ -44,8 +44,8 @@ impl World {
         let old_type = poi_type_for_state(old_state_id);
         let new_type = poi_type_for_state(new_state_id);
 
-        // `ServerLevel.java:1292-1295`：类型没变就什么都不做。
-        if old_type.map(|poi_type| poi_type.name) == new_type.map(|poi_type| poi_type.name) {
+        // `ServerLevel.java:1292-1295`：类型没变（含两边都不是 POI）就什么都不做。
+        if old_type == new_type {
             return;
         }
 
@@ -57,10 +57,7 @@ impl World {
         // `ServerLevel.java:1301-1306`：新类型存在就登记新记录。
         if let Some(poi_type) = new_type {
             poi_storage.add(*position, poi_type.name);
-            trace!(
-                "Registered POI {} at {:?}",
-                poi_type.name, position
-            );
+            trace!("Registered POI {} at {:?}", poi_type.name, position);
         }
     }
 
@@ -78,13 +75,14 @@ impl World {
     /// 重扫是幂等的，不会把村民占用的工作站或床释放掉。
     pub async fn tick_poi_chunk_loads(&self) {
         // 先把通道抽干再上锁：`try_recv` 是同步的，不该跟 POI 锁交错持有。
+        // 坐标一律取区块自报的 `chunk.x/chunk.z`，与扫描用的基准保持一致。
         let mut scanned = Vec::new();
-        while let Ok((position, chunk_weak)) = self.poi_chunk_listener.try_recv() {
+        while let Ok((_position, chunk_weak)) = self.poi_chunk_listener.try_recv() {
             let Some(chunk) = chunk_weak.upgrade() else {
                 continue;
             };
             let found = scan_chunk(&chunk.section, chunk.x, chunk.z);
-            scanned.push((position, found));
+            scanned.push((chunk.x, chunk.z, found));
         }
 
         if scanned.is_empty() {
@@ -92,11 +90,10 @@ impl World {
         }
 
         let mut poi_storage = self.portal_poi.lock().await;
-        for (position, found) in scanned {
-            if poi_storage.rebuild_chunk(position.x, position.y, &found) {
+        for (chunk_x, chunk_z, found) in scanned {
+            if poi_storage.rebuild_chunk(chunk_x, chunk_z, &found) {
                 trace!(
-                    "Rebuilt POI index for chunk {:?}: {} record(s)",
-                    position,
+                    "Rebuilt POI index for chunk ({chunk_x}, {chunk_z}): {} record(s)",
                     found.len()
                 );
             }

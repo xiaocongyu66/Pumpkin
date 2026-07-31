@@ -62,8 +62,7 @@ pub const BAD_OMEN_DURATION: i32 = 120_000;
 /// `BadOmenMobEffect.applyEffectTick` (`BadOmenMobEffect.java:28-35`).
 ///
 /// Returns `true` when vanilla would convert (and therefore *remove* Bad Omen).
-#[must_use]
-pub fn should_convert_bad_omen(world: &Arc<World>, player: &Player) -> bool {
+pub async fn should_convert_bad_omen(world: &Arc<World>, player: &Player) -> bool {
     // `mob instanceof ServerPlayer && !player.isSpectator()`
     if player.is_spectator() {
         return false;
@@ -74,7 +73,7 @@ pub fn should_convert_bad_omen(world: &Arc<World>, player: &Player) -> bool {
     }
     let pos = player.living_entity.entity.block_pos.load();
     // `level.isVillage(player.blockPosition())`
-    if !village::is_village(world, &pos) {
+    if !village::is_village(world, &pos).await {
         return false;
     }
     // `raid == null || raid.getRaidOmenLevel() < raid.getMaxRaidOmenLevel()`
@@ -89,7 +88,7 @@ pub fn should_convert_bad_omen(world: &Arc<World>, player: &Player) -> bool {
 /// Applies Raid Omen at the same amplifier, stores the raid-omen position, and
 /// reports whether Bad Omen must now be removed (vanilla's `return false`).
 pub async fn convert_bad_omen(world: &Arc<World>, player: &Arc<Player>, amplifier: u8) -> bool {
-    if !should_convert_bad_omen(world, player) {
+    if !should_convert_bad_omen(world, player).await {
         return false;
     }
 

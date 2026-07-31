@@ -31,6 +31,7 @@ use pumpkin_data::dimension::Dimension;
 use pumpkin_data::{Block, BlockStateId};
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::math::vector2::Vector2;
+use pumpkin_world::chunk::ChunkData;
 use pumpkin_world::level::Level;
 use pumpkin_world::world::BlockAccessor;
 use pumpkin_world::world::{GetBlockError, WorldPortalExt};
@@ -56,10 +57,10 @@ mod broadcast;
 mod chunks;
 mod collision;
 mod entities;
-mod poi;
 mod player_bedrock;
 mod player_java;
 mod players;
+mod poi;
 mod tick;
 
 use crate::world::natural_spawner::SpawnState;
@@ -144,7 +145,7 @@ pub struct World {
     /// 对应原版读盘时逐 section 调 `PoiManager.checkConsistencyWithBlocks`
     /// (`SerializableChunkData.java:190`)。Pumpkin 的区块加载是异步的，所以改成
     /// 订阅区块就绪事件，在世界 tick 里统一消化，见 `World::tick_poi_chunk_loads`。
-    poi_chunk_listener: crossbeam::channel::Receiver<(Vector2<i32>, Weak<pumpkin_world::chunk::ChunkData>)>,
+    poi_chunk_listener: crossbeam::channel::Receiver<(Vector2<i32>, Weak<ChunkData>)>,
     /// End Dragon fight manager (only present in `THE_END` dimension).
     pub dragon_fight: Option<Mutex<dragon_fight::DragonFight>>,
     pub spawn_state: ArcSwap<SpawnState>,
@@ -432,4 +433,8 @@ mod split_reachability {
 
     // player_bedrock.rs
     const _: () = probe(World::spawn_bedrock_player);
+
+    // poi.rs
+    const _: () = probe(World::update_poi_on_block_state_change);
+    const _: () = probe(World::tick_poi_chunk_loads);
 }

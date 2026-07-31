@@ -102,12 +102,12 @@ mod tests {
     fn workstations_are_indexed_with_absolute_positions() {
         let sections = empty_sections();
         // 区块 (2, -3) 内的一个高炉，y = 70。
-        let bell = BlockPos::new(2 * 16 + 5, 70, -3 * 16 + 11);
+        let blast_furnace = BlockPos::new(2 * 16 + 5, 70, -3 * 16 + 11);
         sections.set_block_absolute_y(5, 70, 11, Block::BLAST_FURNACE.default_state.id);
 
         let found = scan_chunk(&sections, 2, -3);
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].pos(), bell);
+        assert_eq!(found[0].pos(), blast_furnace);
         assert_eq!(found[0].poi_type, "minecraft:armorer");
         // 新扫到的记录票据是满的（armorer 的 maxTickets = 1）。
         assert_eq!(found[0].free_tickets, 1);

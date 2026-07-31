@@ -204,7 +204,7 @@ impl Raids {
         }
 
         // Raids.java:118-131 — average the occupied village POIs within 64 blocks.
-        let center = village::raid_center_for(world, &raid_position);
+        let center = village::raid_center_for(world, &raid_position).await;
 
         // Raids.java:132-135 — reuse the raid already covering the centre.
         let raid = match self.raid_at(&center) {
