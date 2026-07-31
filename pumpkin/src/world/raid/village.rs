@@ -126,6 +126,9 @@ pub async fn village_poi_snapshot(
 }
 
 /// [`QueryShape`] 的边界判定，和 `PoiStorage` 内部用的判定同构。
+///
+/// 仅供测试断言查询形状语义；生产路径直接走 `PoiStorage` 自身的边界判定。
+#[cfg(test)]
 fn in_query_bounds(pos: BlockPos, center: BlockPos, radius: i32, shape: QueryShape) -> bool {
     let dx = i64::from(pos.0.x) - i64::from(center.0.x);
     let dy = i64::from(pos.0.y) - i64::from(center.0.y);
