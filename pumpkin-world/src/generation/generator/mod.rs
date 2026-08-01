@@ -286,7 +286,7 @@ mod tests {
             let generator = generator_for(dimension);
             for (index, set) in generator.possible_structure_sets() {
                 assert!(
-                    std::ptr::eq(set, &StructureSet::ALL[index]),
+                    std::ptr::eq(set, &raw const StructureSet::ALL[index]),
                     "yielded index {index} does not address the yielded set"
                 );
                 // The biome list is keyed by the same index for every set, not
