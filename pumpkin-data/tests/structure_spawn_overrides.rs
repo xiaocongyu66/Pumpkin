@@ -135,7 +135,10 @@ fn fortress_and_outpost_spawn_overrides_preserve_weighted_entries() {
     let outpost = Structure::get(&StructureKeys::PillagerOutpost);
     let outpost_monster = find_override(outpost, StructureSpawnCategory::Monster)
         .expect("pillager outpost must override the monster category");
-    assert_eq!(outpost_monster.bounding_box, StructureSpawnBoundingBox::Full);
+    assert_eq!(
+        outpost_monster.bounding_box,
+        StructureSpawnBoundingBox::Full
+    );
     assert_eq!(
         outpost_monster.spawns,
         &[StructureSpawnEntry {
