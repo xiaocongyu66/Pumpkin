@@ -65,7 +65,10 @@ impl CreeperEntity {
 
             // Vanilla 26.2 Creeper.registerGoals
             goal_selector.add_goal(1, Box::new(SwimGoal::default()));
-            goal_selector.add_goal(2, Box::new(CreeperIgniteGoal::new(mob_arc.clone())));
+            goal_selector.add_goal(
+                2,
+                Box::new(CreeperIgniteGoal::new(Arc::downgrade(&mob_arc))),
+            );
             // AvoidEntityGoal(Ocelot/Cat, 6.0f, 1.0, 1.2)
             goal_selector.add_goal(
                 3,

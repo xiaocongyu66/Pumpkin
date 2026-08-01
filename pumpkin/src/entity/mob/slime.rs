@@ -60,14 +60,8 @@ impl SlimeEntity {
 
             // Weak handles: the goals live inside the slime's own goal selector,
             // so strong `Arc`s here would form a cycle and leak every slime.
-            goal_selector.add_goal(
-                1,
-                Box::new(SlimeFloatGoal::new(Arc::downgrade(&mob_arc))),
-            );
-            goal_selector.add_goal(
-                2,
-                Box::new(SlimeAttackGoal::new(Arc::downgrade(&mob_arc))),
-            );
+            goal_selector.add_goal(1, Box::new(SlimeFloatGoal::new(Arc::downgrade(&mob_arc))));
+            goal_selector.add_goal(2, Box::new(SlimeAttackGoal::new(Arc::downgrade(&mob_arc))));
             goal_selector.add_goal(
                 3,
                 Box::new(SlimeRandomDirectionGoal::new(Arc::downgrade(&mob_arc))),
@@ -624,41 +618,30 @@ impl SlimeRandomDirectionGoal {
 impl Goal for SlimeRandomDirectionGoal {
     fn can_start<'a>(&'a mut self, _mob: &'a dyn Mob) -> GoalFuture<'a, bool> {
         Box::pin(async move {
-            let target = self.slime.entity.target.lock().await;
+            let Some(slime) = self.slime.upgrade() else {
+                return false;
+            };
+            let target = slime.entity.target.lock().await;
+            let entity = &slime.entity.living_entity.entity;
             target.is_none()
-                && (self
-                    .slime
-                    .entity
-                    .living_entity
-                    .entity
-                    .on_ground
-                    .load(Ordering::Relaxed)
-                    || self
-                        .slime
-                        .entity
-                        .living_entity
-                        .entity
-                        .touching_water
-                        .load(Ordering::Relaxed)
-                    || self
-                        .slime
-                        .entity
-                        .living_entity
-                        .entity
-                        .touching_lava
-                        .load(Ordering::Relaxed))
+                && (entity.on_ground.load(Ordering::Relaxed)
+                    || entity.touching_water.load(Ordering::Relaxed)
+                    || entity.touching_lava.load(Ordering::Relaxed))
         })
     }
 
     fn tick<'a>(&'a mut self, _mob: &'a dyn Mob) -> GoalFuture<'a, ()> {
         Box::pin(async move {
+            let Some(slime) = self.slime.upgrade() else {
+                return;
+            };
             self.next_randomize_time -= 1;
             if self.next_randomize_time <= 0 {
                 self.next_randomize_time = rand::random_range(40..100);
                 self.chosen_degrees = rand::random_range(0.0..360.0);
             }
-            self.slime.target_yaw.store(self.chosen_degrees);
-            self.slime.is_aggressive.store(false, Ordering::Relaxed);
+            slime.target_yaw.store(self.chosen_degrees);
+            slime.is_aggressive.store(false, Ordering::Relaxed);
         })
     }
 
