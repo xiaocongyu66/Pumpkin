@@ -17,6 +17,7 @@ pub struct ChasePlayerGoal {
 }
 
 impl ChasePlayerGoal {
+    #[must_use]
     pub const fn new(enderman: Weak<EndermanEntity>) -> Self {
         Self {
             enderman,

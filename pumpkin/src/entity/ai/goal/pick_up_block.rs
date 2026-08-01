@@ -16,6 +16,7 @@ pub struct PickUpBlockGoal {
 }
 
 impl PickUpBlockGoal {
+    #[must_use]
     pub const fn new(enderman: Weak<EndermanEntity>) -> Self {
         Self { enderman }
     }
