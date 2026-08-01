@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::{Controls, Goal, GoalFuture};
 use crate::entity::EntityBase;
@@ -6,13 +6,19 @@ use crate::entity::mob::Mob;
 use crate::entity::mob::enderman::{EndermanEntity, PLAYER_EYE_HEIGHT};
 use crate::entity::player::Player;
 
+/// Vanilla `EnderMan.EndermanFreezeWhenLookedAt` (`EnderMan.java:378-412`).
 pub struct ChasePlayerGoal {
-    enderman: Arc<EndermanEntity>,
+    /// Weak: the enderman owns this goal via its goal selector, so a strong
+    /// handle here would be a reference cycle that leaks the entity.
+    enderman: Weak<EndermanEntity>,
+    /// The stared-at player. Kept strong only while the goal runs and cleared in
+    /// `stop`, so it never outlives the goal's active period.
     target: Option<Arc<Player>>,
 }
 
 impl ChasePlayerGoal {
-    pub const fn new(enderman: Arc<EndermanEntity>) -> Self {
+    #[must_use]
+    pub const fn new(enderman: Weak<EndermanEntity>) -> Self {
         Self {
             enderman,
             target: None,
@@ -44,7 +50,11 @@ impl Goal for ChasePlayerGoal {
                 return false;
             }
 
-            if !self.enderman.is_player_staring(player).await {
+            let Some(enderman) = self.enderman.upgrade() else {
+                self.target = None;
+                return false;
+            };
+            if !enderman.is_player_staring(player).await {
                 self.target = None;
                 return false;
             }
@@ -68,6 +78,9 @@ impl Goal for ChasePlayerGoal {
             let Some(player) = &self.target else {
                 return false;
             };
+            let Some(enderman) = self.enderman.upgrade() else {
+                return false;
+            };
 
             let mob_entity = mob.get_mob_entity();
             let entity = &mob_entity.living_entity.entity;
@@ -77,7 +90,7 @@ impl Goal for ChasePlayerGoal {
                 return false;
             }
 
-            self.enderman.is_player_staring(player).await
+            enderman.is_player_staring(player).await
         })
     }
 
@@ -85,6 +98,13 @@ impl Goal for ChasePlayerGoal {
         Box::pin(async move {
             let mut navigator = mob.get_mob_entity().navigator.lock().unwrap();
             navigator.stop();
+        })
+    }
+
+    fn stop<'a>(&'a mut self, _mob: &'a dyn Mob) -> GoalFuture<'a, ()> {
+        Box::pin(async move {
+            // Release the player handle as soon as the goal ends.
+            self.target = None;
         })
     }
 

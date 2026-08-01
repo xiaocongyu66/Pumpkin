@@ -134,6 +134,26 @@ impl GoalSelector {
         self.disabled_controls.set(control, !enabled);
     }
 
+    /// Vanilla `Mob.updateControlFlags` (`Mob.java:387-393`): `MOVE` and `LOOK`
+    /// follow `no_controller`, `JUMP` additionally requires not sitting in a boat.
+    ///
+    /// Vanilla re-applies this every 5 ticks (`Mob.java:380-385`), which is the
+    /// only thing that ever undoes a one-shot `disableControlFlag`, such as the
+    /// one `Mob.leashTooFarBehaviour` issues when a leash snaps
+    /// (`Mob.java:1304-1306`). Without the periodic re-apply, a mob that breaks
+    /// its leash loses every `MOVE` goal for the rest of its in-memory life.
+    pub const fn update_control_flags(&mut self, no_controller: bool, not_in_boat: bool) {
+        self.set_control_enabled(Controls::MOVE, no_controller);
+        self.set_control_enabled(Controls::JUMP, no_controller && not_in_boat);
+        self.set_control_enabled(Controls::LOOK, no_controller);
+    }
+
+    /// Whether `control` is currently suppressed, i.e. no goal using it may run.
+    #[must_use]
+    pub const fn is_control_disabled(&self, control: Controls) -> bool {
+        self.disabled_controls.get(control)
+    }
+
     fn get_goal_by_control(&mut self, control: Controls) -> Option<&mut PrioritizedGoal> {
         let i = self.goals_by_control[control.idx()];
         self.goals.get_mut(i)

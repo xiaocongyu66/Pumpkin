@@ -6,10 +6,53 @@ use crate::entity::{Entity, EntityBase, NBTStorage, living::LivingEntity};
 use crate::server::Server;
 use pumpkin_data::damage::DamageType;
 use pumpkin_data::item_stack::ItemStack;
+use pumpkin_data::tag::{self, Taggable};
 use pumpkin_protocol::java::client::play::{CHeadRot, CUpdateEntityRot};
 use pumpkin_util::math::vector3::Vector3;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
+
+/// 原版 `Mob.updateControlFlags`（Mob.java:387-393）计算出的两个条件。
+struct ControlFlagState {
+    /// `!(getControllingPassenger() instanceof Mob)`
+    no_controller: bool,
+    /// `!(getVehicle() instanceof AbstractBoat)`
+    not_in_boat: bool,
+}
+
+/// 原版 `Mob.getControllingPassenger`（Mob.java:257-265）：第一个乘客是 `Mob`
+/// 且 `canControlVehicle()`（`Entity.java:2560-2562`，即不在
+/// `minecraft:non_controlling_rider` 标签里），并且本体没被 `NoAI` 关掉。
+async fn control_flag_state(mob: &dyn Mob) -> ControlFlagState {
+    let entity = mob.get_entity();
+
+    let no_controller = if mob.get_mob_entity().is_no_ai() {
+        // NoAI 生物的 getControllingPassenger 返回 null → 视为无控制者。
+        true
+    } else {
+        let passengers = entity.passengers.lock().await;
+        !passengers.first().is_some_and(|passenger| {
+            let passenger_type = passenger.get_entity().entity_type;
+            passenger_type.mob
+                && !passenger_type.has_tag(&tag::EntityType::MINECRAFT_NON_CONTROLLING_RIDER)
+        })
+    };
+
+    let not_in_boat = {
+        let vehicle = entity.vehicle.lock().await;
+        !vehicle.as_ref().is_some_and(|vehicle| {
+            vehicle
+                .get_entity()
+                .entity_type
+                .has_tag(&tag::EntityType::MINECRAFT_BOAT)
+        })
+    };
+
+    ControlFlagState {
+        no_controller,
+        not_in_boat,
+    }
+}
 
 impl<T: Mob + Send + 'static> EntityBase for T {
     fn init_data_tracker(&self) -> EntityBaseFuture<'_, ()> {
@@ -95,6 +138,15 @@ impl<T: Mob + Send + 'static> EntityBase for T {
             let age = mob_entity.living_entity.entity.age.load(Relaxed);
             let entity_id = mob_entity.living_entity.entity.entity_id;
 
+            // 原版 `Mob.tick`（Mob.java:380-385）每 5 tick 调一次
+            // `updateControlFlags()`，它是 `disableControlFlag` 唯一的恢复途径。
+            // 少了它，`leash_too_far_behaviour` 关掉的 MOVE 永远不会再打开。
+            let control_flags = if age % 5 == 0 {
+                Some(control_flag_state(self).await)
+            } else {
+                None
+            };
+
             // 1. "Take" selectors out of the mutexes
             let mut target_selector = {
                 let mut guard = mob_entity.target_selector.lock().unwrap();
@@ -104,6 +156,14 @@ impl<T: Mob + Send + 'static> EntityBase for T {
                 let mut guard = mob_entity.goals_selector.lock().unwrap();
                 std::mem::take(&mut *guard)
             };
+
+            if let Some(ControlFlagState {
+                no_controller,
+                not_in_boat,
+            }) = control_flags
+            {
+                goals_selector.update_control_flags(no_controller, not_in_boat);
+            }
 
             // 2. Perform AI logic (No locks held, so .await is safe!)
             if (age + entity_id) % 2 != 0 && age > 1 {
