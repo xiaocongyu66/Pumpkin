@@ -1,7 +1,12 @@
 use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, quote};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use std::{collections::BTreeMap, fs};
+
+use crate::entity_type::MobCategory;
+
+/// Registry name that vanilla substitutes for every `MISC`-category spawn entry.
+const MISC_SPAWN_REPLACEMENT: &str = "minecraft:pig";
 
 /// Deserialized structure set containing placement rules and weighted structure entries.
 #[derive(Deserialize)]
@@ -103,9 +108,152 @@ pub struct StructureStruct {
     /// trial chambers spawner pools).
     #[serde(default)]
     pub pool_aliases: Vec<PoolAliasBindingStruct>,
+    /// Per-category natural-spawn overrides. Missing categories intentionally
+    /// remain distinct from present categories with empty spawn lists.
+    ///
+    /// A missing key and an empty map both mean "no override", matching vanilla
+    /// `Map::get` returning `null` for every category, so the field defaults.
+    #[serde(default)]
+    pub spawn_overrides: BTreeMap<StructureSpawnCategoryStruct, StructureSpawnOverrideStruct>,
+
     /// Defines the generation behavior (e.g. "minecraft:jigsaw").
     #[serde(rename = "type")]
     pub structure_type: String,
+}
+
+/// Raw `MobCategory` keys accepted in structure `spawn_overrides` data.
+///
+/// Variant order matches vanilla 26.2 `MobCategory.java:14-21`; the map's
+/// `Ord` order keeps generated constants deterministic.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum StructureSpawnCategoryStruct {
+    Monster,
+    Creature,
+    Ambient,
+    Axolotls,
+    UndergroundWaterCreature,
+    WaterCreature,
+    WaterAmbient,
+    Misc,
+}
+
+/// Raw bounding-box discriminator used by a structure spawn override.
+///
+/// Vanilla 26.2 `StructureSpawnOverride.java:20-27` serializes a whole
+/// structure-start box as `full` and individual structure-piece boxes as `piece`.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StructureSpawnBoundingBoxStruct {
+    Full,
+    Piece,
+}
+
+/// Raw per-category natural-spawn override from `structures.json`.
+///
+/// An empty `spawns` vector is meaningful: vanilla returns it instead of the
+/// biome pool when the category exists in the override map.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StructureSpawnOverrideStruct {
+    pub bounding_box: StructureSpawnBoundingBoxStruct,
+    pub spawns: Vec<StructureSpawnEntryStruct>,
+}
+
+/// Raw weighted entity entry in a structure spawn override.
+///
+/// Mirrors vanilla 26.2 `MobSpawnSettings.SpawnerData` plus its enclosing
+/// `WeightedList` entry (`MobSpawnSettings.java:74-80`, `Weighted.java:31-48`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructureSpawnEntryStruct {
+    pub r#type: String,
+    pub min_count: i32,
+    pub max_count: i32,
+    pub weight: i32,
+}
+
+impl<'de> Deserialize<'de> for StructureSpawnEntryStruct {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct RawStructureSpawnEntry {
+            #[serde(rename = "type")]
+            r#type: String,
+            min_count: i32,
+            max_count: i32,
+            weight: i32,
+        }
+
+        let entry = RawStructureSpawnEntry::deserialize(deserializer)?;
+        if entry.min_count <= 0 {
+            return Err(de::Error::custom("minCount must be positive"));
+        }
+        if entry.max_count <= 0 {
+            return Err(de::Error::custom("maxCount must be positive"));
+        }
+        if entry.min_count > entry.max_count {
+            return Err(de::Error::custom(
+                "minCount must be smaller than or equal to maxCount",
+            ));
+        }
+        if entry.weight < 0 {
+            return Err(de::Error::custom("weight must be non-negative"));
+        }
+
+        Ok(Self {
+            r#type: entry.r#type,
+            min_count: entry.min_count,
+            max_count: entry.max_count,
+            weight: entry.weight,
+        })
+    }
+}
+
+/// Reads `entities.json` and collects the registry names whose `MobCategory` is `MISC`.
+///
+/// Only the category is needed here, so the full `EntityType` shape is skipped.
+fn misc_category_entity_names() -> std::collections::BTreeSet<String> {
+    /// Minimal projection of an `entities.json` entry: just the mob category.
+    #[derive(Deserialize)]
+    struct CategoryOnly {
+        category: MobCategory,
+    }
+
+    let entities: BTreeMap<String, CategoryOnly> =
+        serde_json::from_str(&fs::read_to_string("../assets/entities.json").unwrap())
+            .expect("Failed to parse entities.json");
+
+    entities
+        .into_iter()
+        .filter(|(_, entity)| matches!(entity.category, MobCategory::MISC))
+        .map(|(name, _)| format!("minecraft:{name}"))
+        .collect()
+}
+
+/// Applies vanilla's `SpawnerData` canonical-constructor substitution to every
+/// structure spawn entry.
+///
+/// Vanilla 26.2 `MobSpawnSettings.java:82-84` rewrites the entity type of *any*
+/// `SpawnerData` whose type is in `MobCategory.MISC` to `EntityTypes.PIG`, and the
+/// record's canonical constructor runs for every deserialized entry. The
+/// substitution keys off the entity type's own category, not the
+/// `spawn_overrides` map key, so a `MISC`-typed mob listed under `monster` is
+/// rewritten too.
+fn remap_misc_spawn_types(structures: &mut BTreeMap<String, StructureStruct>) {
+    let misc_entities = misc_category_entity_names();
+
+    for structure in structures.values_mut() {
+        for override_data in structure.spawn_overrides.values_mut() {
+            for entry in &mut override_data.spawns {
+                if misc_entities.contains(&entry.r#type) {
+                    entry.r#type = MISC_SPAWN_REPLACEMENT.to_owned();
+                }
+            }
+        }
+    }
 }
 
 /// Deserialized vanilla `PoolAliasBinding`
@@ -146,6 +294,63 @@ pub struct WeightedAliasGroupStruct {
     pub data: Vec<PoolAliasBindingStruct>,
     /// Relative weight.
     pub weight: u32,
+}
+
+impl ToTokens for StructureSpawnCategoryStruct {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let category = match self {
+            Self::Monster => quote!(StructureSpawnCategory::Monster),
+            Self::Creature => quote!(StructureSpawnCategory::Creature),
+            Self::Ambient => quote!(StructureSpawnCategory::Ambient),
+            Self::Axolotls => quote!(StructureSpawnCategory::Axolotls),
+            Self::UndergroundWaterCreature => {
+                quote!(StructureSpawnCategory::UndergroundWaterCreature)
+            }
+            Self::WaterCreature => quote!(StructureSpawnCategory::WaterCreature),
+            Self::WaterAmbient => quote!(StructureSpawnCategory::WaterAmbient),
+            Self::Misc => quote!(StructureSpawnCategory::Misc),
+        };
+        tokens.extend(category);
+    }
+}
+
+impl StructureSpawnCategoryStruct {
+    const ALL: [Self; 8] = [
+        Self::Monster,
+        Self::Creature,
+        Self::Ambient,
+        Self::Axolotls,
+        Self::UndergroundWaterCreature,
+        Self::WaterCreature,
+        Self::WaterAmbient,
+        Self::Misc,
+    ];
+}
+
+impl ToTokens for StructureSpawnBoundingBoxStruct {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let bounding_box = match self {
+            Self::Full => quote!(StructureSpawnBoundingBox::Full),
+            Self::Piece => quote!(StructureSpawnBoundingBox::Piece),
+        };
+        tokens.extend(bounding_box);
+    }
+}
+
+impl ToTokens for StructureSpawnEntryStruct {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let r#type = &self.r#type;
+        let min_count = self.min_count;
+        let max_count = self.max_count;
+        let weight = self.weight;
+
+        tokens.extend(quote!(StructureSpawnEntry {
+            r#type: #r#type,
+            min_count: #min_count,
+            max_count: #max_count,
+            weight: #weight,
+        }));
+    }
 }
 
 impl ToTokens for PoolAliasBindingStruct {
@@ -355,6 +560,18 @@ impl ToTokens for StructureStruct {
         };
 
         let pool_aliases = &self.pool_aliases;
+        let spawn_overrides = StructureSpawnCategoryStruct::ALL
+            .iter()
+            .filter_map(|category| {
+                let override_data = self.spawn_overrides.get(category)?;
+                let bounding_box = override_data.bounding_box;
+                let spawns = &override_data.spawns;
+                Some(quote!(StructureSpawnOverride {
+                    category: #category,
+                    bounding_box: #bounding_box,
+                    spawns: &[#(#spawns),*],
+                }))
+            });
 
         let structure_type = structure_type_to_token(&self.structure_type);
 
@@ -391,6 +608,7 @@ impl ToTokens for StructureStruct {
                 dimension_padding: #dimension_padding,
                 use_expansion_hack: #use_expansion_hack,
                 pool_aliases: &[#(#pool_aliases),*],
+                spawn_overrides: &[#(#spawn_overrides),*],
                 structure_type: #structure_type,
             }
         ));
@@ -428,6 +646,284 @@ fn terrain_adaptation_to_token(ta: &str) -> TokenStream {
         "bury" => quote!(TerrainAdaptation::Bury),
         "encapsulate" => quote!(TerrainAdaptation::Encapsulate),
         _ => quote!(TerrainAdaptation::None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const SPAWN_CATEGORIES: [StructureSpawnCategoryStruct; 8] = StructureSpawnCategoryStruct::ALL;
+
+    fn structures() -> BTreeMap<String, StructureStruct> {
+        serde_json::from_str(include_str!("../../assets/structures.json"))
+            .expect("structures.json must deserialize")
+    }
+
+    #[test]
+    fn fortress_and_outpost_spawn_overrides_preserve_weighted_entries() {
+        let structures = structures();
+
+        let fortress = structures
+            .get("minecraft:fortress")
+            .expect("fortress must exist in structures.json");
+        assert_eq!(
+            fortress
+                .spawn_overrides
+                .get(&StructureSpawnCategoryStruct::Monster),
+            Some(&StructureSpawnOverrideStruct {
+                bounding_box: StructureSpawnBoundingBoxStruct::Piece,
+                spawns: vec![
+                    StructureSpawnEntryStruct {
+                        r#type: "minecraft:blaze".to_owned(),
+                        min_count: 2,
+                        max_count: 3,
+                        weight: 10,
+                    },
+                    StructureSpawnEntryStruct {
+                        r#type: "minecraft:zombified_piglin".to_owned(),
+                        min_count: 4,
+                        max_count: 4,
+                        weight: 5,
+                    },
+                    StructureSpawnEntryStruct {
+                        r#type: "minecraft:wither_skeleton".to_owned(),
+                        min_count: 5,
+                        max_count: 5,
+                        weight: 8,
+                    },
+                    StructureSpawnEntryStruct {
+                        r#type: "minecraft:skeleton".to_owned(),
+                        min_count: 5,
+                        max_count: 5,
+                        weight: 2,
+                    },
+                    StructureSpawnEntryStruct {
+                        r#type: "minecraft:magma_cube".to_owned(),
+                        min_count: 4,
+                        max_count: 4,
+                        weight: 3,
+                    },
+                ],
+            })
+        );
+
+        let outpost = structures
+            .get("minecraft:pillager_outpost")
+            .expect("pillager outpost must exist in structures.json");
+        assert_eq!(
+            outpost
+                .spawn_overrides
+                .get(&StructureSpawnCategoryStruct::Monster),
+            Some(&StructureSpawnOverrideStruct {
+                bounding_box: StructureSpawnBoundingBoxStruct::Full,
+                spawns: vec![StructureSpawnEntryStruct {
+                    r#type: "minecraft:pillager".to_owned(),
+                    min_count: 1,
+                    max_count: 1,
+                    weight: 1,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn empty_spawn_overrides_remain_distinct_from_absent_categories() {
+        let structures = structures();
+
+        for (structure_name, bounding_box) in [
+            (
+                "minecraft:ancient_city",
+                StructureSpawnBoundingBoxStruct::Full,
+            ),
+            (
+                "minecraft:trial_chambers",
+                StructureSpawnBoundingBoxStruct::Piece,
+            ),
+        ] {
+            let structure = structures
+                .get(structure_name)
+                .expect("structure with empty spawn overrides must exist");
+            assert_eq!(structure.spawn_overrides.len(), SPAWN_CATEGORIES.len());
+            for category in SPAWN_CATEGORIES {
+                assert_eq!(
+                    structure.spawn_overrides.get(&category),
+                    Some(&StructureSpawnOverrideStruct {
+                        bounding_box,
+                        spawns: Vec::new(),
+                    })
+                );
+            }
+        }
+
+        assert!(
+            structures
+                .get("minecraft:bastion_remnant")
+                .expect("bastion remnant must exist in structures.json")
+                .spawn_overrides
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn monument_and_swamp_hut_preserve_all_categories_and_bounds() {
+        let structures = structures();
+
+        let monument = structures
+            .get("minecraft:monument")
+            .expect("monument must exist in structures.json");
+        assert_eq!(monument.spawn_overrides.len(), 3);
+        assert_eq!(
+            monument
+                .spawn_overrides
+                .get(&StructureSpawnCategoryStruct::Monster),
+            Some(&StructureSpawnOverrideStruct {
+                bounding_box: StructureSpawnBoundingBoxStruct::Full,
+                spawns: vec![StructureSpawnEntryStruct {
+                    r#type: "minecraft:guardian".to_owned(),
+                    min_count: 2,
+                    max_count: 4,
+                    weight: 1,
+                }],
+            })
+        );
+        for category in [
+            StructureSpawnCategoryStruct::Axolotls,
+            StructureSpawnCategoryStruct::UndergroundWaterCreature,
+        ] {
+            assert_eq!(
+                monument.spawn_overrides.get(&category),
+                Some(&StructureSpawnOverrideStruct {
+                    bounding_box: StructureSpawnBoundingBoxStruct::Full,
+                    spawns: Vec::new(),
+                })
+            );
+        }
+
+        let swamp_hut = structures
+            .get("minecraft:swamp_hut")
+            .expect("swamp hut must exist in structures.json");
+        assert_eq!(swamp_hut.spawn_overrides.len(), 2);
+        assert_eq!(
+            swamp_hut
+                .spawn_overrides
+                .get(&StructureSpawnCategoryStruct::Creature),
+            Some(&StructureSpawnOverrideStruct {
+                bounding_box: StructureSpawnBoundingBoxStruct::Piece,
+                spawns: vec![StructureSpawnEntryStruct {
+                    r#type: "minecraft:cat".to_owned(),
+                    min_count: 1,
+                    max_count: 1,
+                    weight: 1,
+                }],
+            })
+        );
+        assert_eq!(
+            swamp_hut
+                .spawn_overrides
+                .get(&StructureSpawnCategoryStruct::Monster),
+            Some(&StructureSpawnOverrideStruct {
+                bounding_box: StructureSpawnBoundingBoxStruct::Piece,
+                spawns: vec![StructureSpawnEntryStruct {
+                    r#type: "minecraft:witch".to_owned(),
+                    min_count: 1,
+                    max_count: 1,
+                    weight: 1,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn missing_spawn_overrides_are_rejected() {
+        let error = serde_json::from_str::<StructureStruct>(
+            r##"{
+                "biomes": "#minecraft:test",
+                "step": "surface_structures",
+                "type": "minecraft:buried_treasure"
+            }"##,
+        )
+        .err()
+        .expect("structure without spawn_overrides must fail to deserialize");
+
+        assert!(error.to_string().contains("spawn_overrides"));
+    }
+
+    #[test]
+    fn invalid_spawn_entries_are_rejected() {
+        for (min_count, max_count, weight, expected_error) in [
+            (0, 1, 0, "minCount must be positive"),
+            (1, 0, 0, "maxCount must be positive"),
+            (
+                2,
+                1,
+                0,
+                "minCount must be smaller than or equal to maxCount",
+            ),
+            (1, 1, -1, "weight must be non-negative"),
+        ] {
+            let json = format!(
+                r##"{{
+                    "type": "minecraft:test",
+                    "minCount": {min_count},
+                    "maxCount": {max_count},
+                    "weight": {weight}
+                }}"##
+            );
+            let error = serde_json::from_str::<StructureSpawnEntryStruct>(&json)
+                .err()
+                .expect("invalid spawn data must fail to deserialize");
+            assert!(error.to_string().contains(expected_error));
+        }
+    }
+
+    #[test]
+    fn spawn_override_token_preserves_present_empty_categories_and_category_order() {
+        let structure = StructureStruct {
+            biomes: "#minecraft:test".to_owned(),
+            step: "surface_structures".to_owned(),
+            start_pool: None,
+            start_jigsaw_name: None,
+            size: None,
+            terrain_adaptation: None,
+            start_height: None,
+            project_start_to_heightmap: None,
+            max_distance_from_center: None,
+            liquid_settings: None,
+            dimension_padding: None,
+            use_expansion_hack: None,
+            pool_aliases: Vec::new(),
+            spawn_overrides: BTreeMap::from([
+                (
+                    StructureSpawnCategoryStruct::Monster,
+                    StructureSpawnOverrideStruct {
+                        bounding_box: StructureSpawnBoundingBoxStruct::Full,
+                        spawns: Vec::new(),
+                    },
+                ),
+                (
+                    StructureSpawnCategoryStruct::WaterAmbient,
+                    StructureSpawnOverrideStruct {
+                        bounding_box: StructureSpawnBoundingBoxStruct::Piece,
+                        spawns: Vec::new(),
+                    },
+                ),
+            ]),
+            structure_type: "minecraft:buried_treasure".to_owned(),
+        };
+
+        let tokens = quote::quote!(#structure).to_string();
+        let monster = tokens
+            .find("category : StructureSpawnCategory :: Monster")
+            .expect("monster override must be emitted");
+        let water_ambient = tokens
+            .find("category : StructureSpawnCategory :: WaterAmbient")
+            .expect("water ambient override must be emitted");
+        assert!(monster < water_ambient);
+        assert!(tokens.contains("bounding_box : StructureSpawnBoundingBox :: Full"));
+        assert!(tokens.contains("bounding_box : StructureSpawnBoundingBox :: Piece"));
+        assert_eq!(tokens.matches("spawns : & []").count(), 2);
     }
 }
 
@@ -510,9 +1006,11 @@ fn generation_step_to_token(step: &str) -> TokenStream {
 
 /// Reads `structures.json` and `structure_set.json` and emits the complete structures `TokenStream`.
 pub fn build() -> TokenStream {
-    let structures_json: BTreeMap<String, StructureStruct> =
+    let mut structures_json: BTreeMap<String, StructureStruct> =
         serde_json::from_str(&fs::read_to_string("../assets/structures.json").unwrap())
             .expect("Failed to parse structures.json");
+
+    remap_misc_spawn_types(&mut structures_json);
 
     let structure_sets_json: BTreeMap<String, StructureSetStruct> =
         serde_json::from_str(&fs::read_to_string("../assets/structure_set.json").unwrap())
@@ -713,7 +1211,59 @@ pub fn build() -> TokenStream {
             pub dimension_padding: Option<i32>,
             pub use_expansion_hack: Option<bool>,
             pub pool_aliases: &'static [PoolAliasBinding],
+            /// Per-category structure-specific natural-spawn pools.
+            ///
+            /// Vanilla 26.2 `ChunkGenerator.getMobsAt` (`ChunkGenerator.java:364-380`)
+            /// falls back to biome spawns only when the category has no entry. A present
+            /// entry with an empty `spawns` slice therefore suppresses that category.
+            pub spawn_overrides: &'static [StructureSpawnOverride],
             pub structure_type: StructureType,
+        }
+
+        /// A structure-specific natural-spawn pool for one mob category.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct StructureSpawnOverride {
+            pub category: StructureSpawnCategory,
+            pub bounding_box: StructureSpawnBoundingBox,
+            pub spawns: &'static [StructureSpawnEntry],
+        }
+
+        /// The volume in which a structure spawn override applies.
+        ///
+        /// Vanilla 26.2 `StructureSpawnOverride.java:23-27` serializes whole
+        /// structure-start bounds as `full` and individual piece bounds as `piece`.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum StructureSpawnBoundingBox {
+            Full,
+            Piece,
+        }
+
+        /// A mob category in a structure `spawn_overrides` map.
+        ///
+        /// This remains local to structure data so the `structures` feature does not
+        /// require the entity registry. Runtime spawning can map it to `MobCategory`.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum StructureSpawnCategory {
+            Monster,
+            Creature,
+            Ambient,
+            Axolotls,
+            UndergroundWaterCreature,
+            WaterCreature,
+            WaterAmbient,
+            Misc,
+        }
+
+        /// One weighted entity entry in a structure spawn override.
+        ///
+        /// The namespaced type is intentionally retained as data, matching biome
+        /// spawner entries and allowing later runtime resolution through the entity registry.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct StructureSpawnEntry {
+            pub r#type: &'static str,
+            pub min_count: i32,
+            pub max_count: i32,
+            pub weight: i32,
         }
 
         #[derive(Clone, Copy, Debug)]
@@ -802,5 +1352,6 @@ pub fn build() -> TokenStream {
                 }
             }
         }
+
     )
 }
