@@ -261,7 +261,24 @@ impl JavaClient {
         self.connection_state.store(ConnectionState::Play);
 
         let profile = self.gameprofile.lock().await.clone();
-        let profile = profile.unwrap();
+        // Vanilla's configuration listener receives the profile from the login cookie,
+        // so it can never be missing there. Here the client controls packet order, and a
+        // client that jumps straight to config-acknowledged without finishing login
+        // leaves us without a profile. Drop that one connection like vanilla does for a
+        // configuration-phase protocol error instead of panicking and taking the whole
+        // server process down with it.
+        let Some(profile) = profile else {
+            warn!(
+                "Client {} acknowledged configuration without a game profile; disconnecting",
+                self.id
+            );
+            self.kick(TextComponent::translate(
+                translation::java::MULTIPLAYER_DISCONNECT_CONFIGURATION_ERROR,
+                [],
+            ))
+            .await;
+            return PacketHandlerResult::Stop;
+        };
         let address = self.address.lock().await;
 
         if let Some(reason) = can_not_join(&profile, &address, server).await {
