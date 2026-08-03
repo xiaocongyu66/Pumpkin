@@ -15,6 +15,18 @@ impl TheEndBiomeSupplier {
     const MIDLANDS_BIOME: Biome = Biome::END_MIDLANDS;
     const SMALL_ISLANDS_BIOME: Biome = Biome::SMALL_END_ISLANDS;
     const BARRENS_BIOME: Biome = Biome::END_BARRENS;
+
+    /// Every biome this supplier can return, i.e. vanilla's
+    /// `TheEndBiomeSource.collectPossibleBiomes`
+    /// (`/root/Vanilla/src/net/minecraft/world/level/biome/TheEndBiomeSource.java:47-50`),
+    /// which feeds `BiomeSource.possibleBiomes()`.
+    pub const POSSIBLE_BIOMES: [u16; 5] = [
+        Self::CENTER_BIOME.id as u16,
+        Self::HIGHLANDS_BIOME.id as u16,
+        Self::MIDLANDS_BIOME.id as u16,
+        Self::SMALL_ISLANDS_BIOME.id as u16,
+        Self::BARRENS_BIOME.id as u16,
+    ];
 }
 
 impl BiomeSupplier for TheEndBiomeSupplier {

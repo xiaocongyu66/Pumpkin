@@ -7,9 +7,12 @@
 //! inside loops hoist [`enabled`] into a local instead of re-reading the flag on
 //! every iteration.
 //!
-//! The high-volume sites (chunk-edge biome fallback, structure reference sweep)
-//! are additionally rate limited: only the first hit and every Nth hit after it
-//! reach the log, so a busy generation pool cannot flood the console.
+//! The high-volume sites (chunk-edge biome fallback, and every reference-sweep
+//! site: [`structure_lazy_accepted`], [`structure_lazy_declined`],
+//! [`structure_reference_missing_start`]) are additionally rate limited via the
+//! `sampled` helper: only the first hit and every Nth hit after it reach the log, so a
+//! busy generation pool cannot flood the console. Each of them carries its own
+//! running counter in the message, so the real volume stays readable.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +37,8 @@ const QUART_SAMPLE_STRIDE: u64 = 512;
 
 static REFERENCE_MISSES: AtomicU64 = AtomicU64::new(0);
 static QUART_CLAMPS: AtomicU64 = AtomicU64::new(0);
+static LAZY_ACCEPTS: AtomicU64 = AtomicU64::new(0);
+static LAZY_DECLINES: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// Mineshaft piece-tree truncations, per generating thread. Mineshaft
@@ -159,18 +164,29 @@ pub fn structure_start_declined(
 }
 
 /// A neighbour's start was recomputed for the reference pass and accepted.
+///
+/// Rate limited like [`structure_reference_missing_start`]: the reference sweep
+/// re-runs the same start for every chunk within 8 chunks of it, so the raw hit
+/// count is ~289x the number of distinct structures. The `#{n}` counter is what
+/// makes the real volume readable from a sampled log.
 pub fn structure_lazy_accepted(key: StructureKeys, chunk_x: i32, chunk_z: i32, start: BlockPos) {
     if !enabled() {
         return;
     }
-    let pos = start.0;
-    info!(
-        "worldgen/structure: {key:?} start computed for chunk ({chunk_x}, {chunk_z}) at ({}, {}, {}) (reference pass)",
-        pos.x, pos.y, pos.z
-    );
+    if let Some(n) = sampled(&LAZY_ACCEPTS, REFERENCE_SAMPLE_STRIDE) {
+        let pos = start.0;
+        info!(
+            "worldgen/structure: {key:?} start computed for chunk ({chunk_x}, {chunk_z}) at ({}, {}, {}) (reference pass, accept #{n})",
+            pos.x, pos.y, pos.z
+        );
+    }
 }
 
 /// A neighbour's start was recomputed for the reference pass and rejected.
+///
+/// Rate limited for the same reason as [`structure_lazy_accepted`]; this is the
+/// higher-volume of the two, since a rejected candidate is retried from every
+/// surrounding chunk without ever being cached as a start.
 pub fn structure_lazy_declined(
     key: StructureKeys,
     chunk_x: i32,
@@ -180,9 +196,11 @@ pub fn structure_lazy_declined(
     if !enabled() {
         return;
     }
-    info!(
-        "worldgen/structure: {key:?} rejected for chunk ({chunk_x}, {chunk_z}): {reject:?} (reference pass)"
-    );
+    if let Some(n) = sampled(&LAZY_DECLINES, REFERENCE_SAMPLE_STRIDE) {
+        info!(
+            "worldgen/structure: {key:?} rejected for chunk ({chunk_x}, {chunk_z}): {reject:?} (reference pass, reject #{n})"
+        );
+    }
 }
 
 /// This chunk picked up pieces of a structure started elsewhere.
